@@ -1,0 +1,796 @@
+:root {
+  --bg: #0a0d12;
+  /* Black, but with enough gap in the alpha that it reads as a translucent
+     sheet over the map rather than an opaque card. --bg-panel-strong is a
+     touch more opaque for small badges nested on top of an already-glassy
+     surface, so they still read as a distinct layer. */
+  --bg-panel: rgba(0, 0, 0, 0.65);
+  --bg-panel-strong: rgba(0, 0, 0, 0.78);
+  /* Flat black tint, no top sheen/highlight layered on — that extra
+     highlight previously read as a stray light outline/border along the
+     top edge rather than a subtle glass cue. */
+  --glass-tint: none;
+  /* No stroke around these chips by design — just a soft outer shadow for
+     depth, no inset highlight either (see --glass-tint above). */
+  --glass-shadow: 0 22px 50px rgba(0, 0, 0, 0.5);
+  /* A light blur so the translucency actually shows blurred shapes moving
+     behind it (the "glass" part) rather than just a dimmed flat tint;
+     saturate kept low so colour (e.g. the ocean) still doesn't tint it. */
+  --glass-blur: blur(28px) saturate(0.4);
+  --accent: #45d7ff;
+  --accent-dim: #2f9cc4;
+  --accent-soft: rgba(69, 215, 255, 0.16);
+  --accent-amber: #ffb454;
+  --accent-red: #ff4d5e;
+  --text: #eef4f9;
+  --text-dim: #a8b4c0;
+  --text-faint: #8792a0;
+  --font-display: 'Nunito Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --radius-sm: 11px;
+  --tap: 44px;
+  /* Space the floating chips (zoom control, tool stack, legend) must clear so
+     they stack above the control island instead of sliding underneath it —
+     island bottom offset + its own height + a breathing gap. */
+  --island-clear: calc(128px + env(safe-area-inset-bottom));
+}
+
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  :root {
+    --island-clear: 144px;
+  }
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.radar-app {
+  position: fixed;
+  /* inset:0 with no explicit height — the simplest correct form. Verified in the
+     iOS Simulator that no CSS height value (vh/dvh/lvh, or a JS-measured
+     innerHeight/visualViewport px value) changes anything for a home-screen
+     launch; the viewport meta in index.html is the lever that actually does. */
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-display);
+  overflow: hidden;
+  touch-action: pan-x pan-y;
+}
+
+.live-badge {
+  background: var(--accent-red);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.live-badge::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #fff;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ---------- Map ---------- */
+
+.map-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+/* The band behind the status bar is the viewport canvas painted with body's
+   background — nothing can be drawn into it (verified: even a fixed element at
+   bottom:-70px with z-index 99999 renders nothing there). So rather than fight
+   it, this scrim fades --bg down into the map, turning a hard letterbox edge
+   into a deliberate piece of chrome. Standalone only: in a browser tab Safari's
+   own toolbar occupies that space and there is no band to blend. */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  .map-wrap::before {
+    content: '';
+    position: absolute;
+    inset: 0 0 auto 0;
+    /* 48px is the measured floor. Steepest alpha drop is 0.14 per 4pt here,
+       against 0.09 at 76px and 0.25 at 24px — below this the slope doubles and
+       the transition starts reading as a cut edge again. */
+    height: 48px;
+    /* Eased rather than linear on purpose. A straight ramp still lets map
+       texture appear abruptly a few pixels below the band, which is the thing
+       that reads as a cut edge. Holding near-opaque for the first ~15% and then
+       falling away slowly means detail emerges gradually enough that there is
+       no line for the eye to catch. */
+    background: linear-gradient(
+      to bottom,
+      var(--bg) 0%,
+      color-mix(in srgb, var(--bg) 97%, transparent) 15%,
+      color-mix(in srgb, var(--bg) 85%, transparent) 30%,
+      color-mix(in srgb, var(--bg) 62%, transparent) 45%,
+      color-mix(in srgb, var(--bg) 38%, transparent) 60%,
+      color-mix(in srgb, var(--bg) 18%, transparent) 75%,
+      color-mix(in srgb, var(--bg) 6%, transparent) 88%,
+      transparent 100%
+    );
+    /* Above Leaflet's marker pane (600) so pins fade with the tiles under it,
+       but below the floating chips, which are lifted to 700 for this reason. */
+    z-index: 690;
+    pointer-events: none;
+  }
+}
+
+.leaflet-container {
+  background: var(--bg);
+  font-family: var(--font-display);
+}
+
+/* Positron's tiles are a light basemap with subtle color (pale blue water,
+   pale green parks, near-white land/roads) — invert(1) hue-rotate(180deg)
+   flips lightness into a dark theme while rotating each hue back to where it
+   started, so water stays blue and parks stay green instead of everything
+   going gray. A big saturate boost afterward brings those pale tints up to a
+   readable dark blue/green since Positron's colors are faint to begin with;
+   contrast/brightness lift land off pure black. Scoped to the base tile
+   layer only (Leaflet applies this className per-tile), leaving the radar
+   overlay's own glow filter untouched. */
+.basemap-tile {
+  filter: invert(1) hue-rotate(180deg) contrast(1) brightness(2.4) saturate(2.4);
+}
+
+/* Small, unobtrusive credit for the free CARTO/OpenStreetMap tier — sits in
+   the thin strip below the floating controls rather than Leaflet's default
+   attribution box. */
+.map-attribution {
+  position: absolute;
+  left: 10px;
+  bottom: calc(3px + env(safe-area-inset-bottom));
+  /* Below the legend (400), which overlaps it in this corner and must stay
+     on top; the legend sits further up (bottom: 22px) to clear this strip. */
+  z-index: 300;
+  font-size: 9px;
+  color: rgba(147, 163, 179, 0.55);
+  pointer-events: none;
+}
+
+.map-attribution a {
+  color: inherit;
+  pointer-events: auto;
+  text-decoration: none;
+}
+
+.map-attribution a:hover,
+.map-attribution a:active {
+  color: var(--text-dim);
+}
+
+.map-tool-stack {
+  position: absolute;
+  /* Now the lowest chip on this side, clearing the control island directly
+     (pinch-to-zoom covers what the removed +/- control did). */
+  bottom: var(--island-clear);
+  right: calc(14px + env(safe-area-inset-right));
+  z-index: 400;
+  display: flex;
+  flex-direction: column;
+  background: var(--glass-tint), var(--bg-panel);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.tool-btn {
+  width: var(--tap);
+  height: var(--tap);
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.tool-btn:last-child {
+  border-bottom: none;
+}
+
+.tool-btn:active {
+  background: var(--accent-soft);
+}
+
+.tool-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* Live "you are here" marker — pulsing dot matching the legend's radar-pulse
+   treatment, plus an accuracy ring drawn directly by Leaflet (MyLocationControl). */
+.my-location-icon {
+  background: transparent;
+  border: none;
+  pointer-events: none;
+}
+
+.my-location-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+  animation: my-location-pulse 2.2s ease-out infinite;
+}
+
+@keyframes my-location-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(69, 215, 255, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 14px rgba(69, 215, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(69, 215, 255, 0);
+  }
+}
+
+.source-tray {
+  position: absolute;
+  top: calc(14px + env(safe-area-inset-top));
+  right: calc(14px + env(safe-area-inset-right));
+  /* 700 keeps these clear of the top scrim (690) — see .map-wrap::before. */
+  z-index: 700;
+  display: flex;
+  background: var(--glass-tint), var(--bg-panel);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  border-radius: 999px;
+  padding: 3px;
+}
+
+/* The sliding pill behind whichever label is active — an actual iOS-style
+   toggle/segmented-control thumb, rather than each button just swapping its
+   own background flat. Glides via transform so the move itself is the
+   animation, not a colour swap.
+
+   Both this and .source-tray-btn use a fixed px width rather than 50%/flex:1
+   on purpose: "SG" and "GLOBAL" have very different natural widths, and on
+   an auto-sized flex container, flex:1 doesn't actually force two equal
+   halves — with no free space to distribute, each item just gets its own
+   content width. That made the thumb's 50% math describe a box that
+   matched neither button: too wide/off-centre for "SG", too narrow for
+   "GLOBAL" (clipping its last letter). A shared fixed width sidesteps the
+   ambiguity entirely — both the thumb and every button are always
+   identically sized, so they can't drift apart. 76px comfortably fits
+   "GLOBAL" (the longer label) plus its padding. */
+.source-tray-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  bottom: 3px;
+  width: 76px;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: transform 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.source-tray.shifted .source-tray-thumb {
+  transform: translateX(76px);
+}
+
+.source-tray-btn {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  width: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 700;
+  min-height: 32px;
+  padding: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  text-align: center;
+  transition: color 0.2s ease;
+}
+
+.source-tray-btn.active {
+  color: #05141c;
+}
+
+/* The whole panel is itself a button — collapsed, its face is a swatch of
+   the actual gradient (no separate "what does this icon mean" step);
+   expanded, tapping anywhere in it (not just a small icon) closes it back
+   down, since the whole card is now the toggle.
+
+   Both the swatch and the full scale are always mounted (never
+   conditionally rendered) so the collapsed<->expanded change is an actual
+   CSS transition — size and cross-fade — instead of one element popping
+   out of existence and another popping in. */
+.legend {
+  position: absolute;
+  /* Clears the floating control island, which now spans nearly the full
+     width beneath it — see --island-clear. */
+  bottom: var(--island-clear);
+  left: calc(14px + env(safe-area-inset-left));
+  z-index: 400;
+  width: var(--tap);
+  height: var(--tap);
+  background: var(--glass-tint), var(--bg-panel);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  border-radius: var(--radius-lg);
+  border: none;
+  margin: 0;
+  padding: 0;
+  color: var(--text-dim);
+  font: inherit;
+  overflow: hidden;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition:
+    width 0.32s cubic-bezier(0.32, 0.72, 0, 1),
+    height 0.32s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.legend.open {
+  width: 124px;
+  height: 168px;
+}
+
+/* The icon: a small pill filled with the same gradient the expanded scale
+   below uses, light at the bottom rising to heavy at the top — so even
+   collapsed, it reads as "intensity scale", not a generic info glyph.
+   Absolutely positioned (centred on the 44px collapsed box) so it doesn't
+   get dragged around by the body's own layout as the button resizes. */
+.legend-swatch {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  opacity: 1;
+  transition: opacity 0.16s ease;
+}
+
+.legend.open .legend-swatch {
+  opacity: 0;
+}
+
+.legend-body {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  padding: 14px 16px 14px 14px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.legend.open .legend-body {
+  opacity: 1;
+  transition-delay: 0.1s;
+}
+
+.legend-gradient {
+  width: 10px;
+  height: 128px;
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+  flex-shrink: 0;
+}
+
+.legend-ticks {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: var(--text);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+  white-space: nowrap;
+}
+
+/* RainViewer's app renders cells as soft glowing blobs rather than flat
+   pixelated tiles — a light blur to round off hard edges plus two stacked
+   drop-shadows (a tight blue inner glow, a wider warm outer bloom) fake that
+   look on our existing tile/image layers without any pixel-level recolor. */
+.radar-image {
+  image-rendering: auto;
+  filter: var(--radar-glow-filter, blur(1.5px) saturate(1.9) contrast(1.2) brightness(1.15));
+  /* Keep in sync with FADE_MS in RadarMap.tsx. */
+  /* Keep in sync with FADE_MS in RadarMap.tsx. A slower easing curve at the
+     tail (vs plain ease) makes consecutive frames feel like they're drifting
+     into place rather than snapping. */
+  transition:
+    opacity 600ms cubic-bezier(0.22, 0.61, 0.36, 1),
+    filter 600ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+:root {
+  --radar-glow-filter: blur(1.5px) saturate(1.9) contrast(1.2) brightness(1.15) drop-shadow(0 0 6px rgba(70, 170, 255, 0.65))
+    drop-shadow(0 0 18px rgba(255, 196, 120, 0.45));
+  --radar-glow-filter-transition: blur(4px) saturate(1.9) contrast(1.2) brightness(1.15) drop-shadow(0 0 6px rgba(70, 170, 255, 0.65))
+    drop-shadow(0 0 18px rgba(255, 196, 120, 0.45));
+}
+
+/* Incoming frame: starts slightly blurred and sharpens as it fades in, so
+   consecutive frames feel like they're flowing/dissolving into each other
+   rather than a flat crossfade. */
+.radar-image-enter {
+  filter: var(--radar-glow-filter-transition);
+}
+
+/* Outgoing frame: blurs further as it fades out, reinforcing the same
+   dissolve — applied together with the enter blur above. */
+.radar-image-exit {
+  filter: var(--radar-glow-filter-transition);
+}
+
+/* Small drifting wind-direction arrows, matching RainViewer's animated wind
+   indicators. --bearing is set inline per-marker from the real measured
+   wind bearing at that station. */
+.wind-arrow-icon {
+  background: transparent;
+  border: none;
+  pointer-events: none;
+}
+
+.wind-arrow-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+
+.wind-arrow {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 13px;
+  transform: rotate(var(--bearing));
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
+  animation: wind-arrow-drift 3.2s ease-in-out infinite;
+}
+
+.wind-speed-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: #eef4f9;
+  background: rgba(10, 14, 19, 0.55);
+  border-radius: 5px;
+  padding: 0 4px;
+  line-height: 1.4;
+  white-space: nowrap;
+  backdrop-filter: blur(2px);
+}
+
+@keyframes wind-arrow-drift {
+  0%,
+  100% {
+    transform: rotate(var(--bearing)) translateY(0);
+    opacity: 0.85;
+  }
+  50% {
+    transform: rotate(var(--bearing)) translateY(-3px);
+    opacity: 1;
+  }
+}
+
+/* ---------- Floating control island ---------- */
+
+/* A self-contained glass card floating over the map rather than a docked
+   footer, so the map itself stretches all the way to the true bottom edge —
+   the island sits on top of it with its own margin, shadow and rounded
+   corners instead of squeezing the map's height. */
+.radar-controls {
+  position: absolute;
+  left: calc(14px + env(safe-area-inset-left));
+  right: calc(14px + env(safe-area-inset-right));
+  bottom: calc(18px + env(safe-area-inset-bottom));
+  background: var(--glass-tint), var(--bg-panel);
+  backdrop-filter: var(--glass-blur);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--glass-shadow);
+  padding: 14px 16px 16px;
+  /* Above the top scrim (690) and every other floating chip, since it's the
+     one piece of chrome meant to read as sitting above all of them. */
+  z-index: 800;
+}
+
+/* A home-screen launch reaches the bottom edge of the screen (see the
+   viewport note in index.html), which means the island would otherwise sit
+   flush against — or under — the home indicator. env() can't size this for
+   us: dropping viewport-fit=cover also zeroes safe-area-inset-bottom, so the
+   clearance has to be stated outright. */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  .radar-controls {
+    bottom: 34px;
+  }
+}
+
+/* Grid rather than space-between: equal 1fr side columns pin the time to the
+   true centre of the footer, so it doesn't drift as the badge swaps between
+   "LIVE" and a wider offset like "+1h 45m". */
+.frame-time-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  margin-bottom: 2px;
+}
+
+/* A button (not a static row) — tapping it while offset from live jumps
+   straight back to now, replacing the separate "Now" button. */
+.frame-time-center {
+  display: flex;
+  /* Was baseline — the LIVE pill's own text baseline sits lower inside its
+     padding than the big time text's baseline, so the two never actually
+     lined up. Centring the boxes themselves keeps the pill level with the
+     time regardless of font metrics. */
+  align-items: center;
+  gap: 9px;
+  background: none;
+  border: none;
+  padding: 0;
+  /* Buttons don't inherit text colour from their parent by default in every
+     browser, so the time was rendering in the UA's own default (dimmer)
+     button colour instead of the app's white text token. */
+  color: var(--text);
+  cursor: pointer;
+}
+
+.frame-time-center:disabled {
+  cursor: default;
+}
+
+/* The full past/future range bounds, flanking the current frame time. */
+.range-edge {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-faint);
+  min-width: 28px;
+}
+
+.range-edge:last-child {
+  text-align: right;
+}
+
+.frame-time {
+  font-family: var(--font-mono);
+  font-size: 17px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.3px;
+}
+
+.offset-badge {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-dim);
+  /* The stronger, less-translucent tint (not --bg-panel) since this already
+     sits nested on the glass island — a second layer of translucency here
+     would just erode contrast rather than add any real glass effect. */
+  background: var(--bg-panel-strong);
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+
+.controls-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* A slim outlined ring rather than a heavy filled disc — sized down from the
+   44px tap grid so it reads as a quiet transport control, not the loudest
+   thing in the footer. */
+.play-btn {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  text-align: center;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-family: var(--font-display);
+  border-radius: 999px;
+  font-size: 16px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.play-btn:active {
+  filter: brightness(1.15);
+}
+
+/* Cycles 1x -> 2x -> 3x -> 1x on tap. Sized/shaped like a small pill rather
+   than matching the round transport buttons, so it reads as a value toggle
+   rather than another play/pause-style control. */
+.speed-btn {
+  min-width: 30px;
+  height: 24px;
+  padding: 0 7px;
+  flex-shrink: 0;
+  background: var(--bg-panel-strong);
+  border: none;
+  border-radius: 999px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.speed-btn:active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.timeline-wrap {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  /* The map underneath (and .radar-app) claims pan-x/pan-y touch handling,
+     which on iOS can race the OS's own drag recognition for the slider thumb
+     and make dragging feel laggy/dropped. Reserving this whole strip for the
+     slider's own gesture handling fixes that. */
+  touch-action: none;
+}
+
+/* Custom track/thumb so the slider reads as a row of frame dots (matching
+   RainViewer's app timeline) rather than a plain filled bar. */
+.timeline {
+  /* Its own height rather than the 44px --tap grid: the track spans the full
+     width, so the row is easy to hit without the input also being the tallest
+     thing in the footer. display:block drops the inline baseline slack too. */
+  --timeline-h: 34px;
+  display: block;
+  width: 100%;
+  height: var(--timeline-h);
+  /* input[type=range] carries a 2px UA margin on all sides. */
+  margin: 0;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  touch-action: none;
+}
+
+.timeline::-webkit-slider-runnable-track {
+  height: var(--timeline-h);
+  background-image: radial-gradient(circle, #38424f 1.4px, transparent 1.6px);
+  background-size: 10px 100%;
+  background-repeat: repeat-x;
+  background-position: center;
+}
+
+.timeline::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: calc((var(--timeline-h) - 13px) / 2);
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  cursor: pointer;
+}
+
+.timeline::-moz-range-track {
+  height: 3px;
+  background-image: radial-gradient(circle, #38424f 1.4px, transparent 1.6px);
+  background-size: 10px 100%;
+  background-repeat: repeat-x;
+  background-position: center;
+}
+
+.timeline::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  cursor: pointer;
+}
+
+.refresh-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.refresh-btn:active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.refresh-btn.spinning {
+  color: var(--accent);
+}
+
+.refresh-btn.spinning svg {
+  animation: refresh-spin 0.9s linear;
+}
+
+@keyframes refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- Larger phones (iPhone Pro Max class, ~430px+ CSS width) ---------- */
+
+@media (min-width: 428px) {
+  .frame-time {
+    font-size: 19px;
+  }
+
+  .legend-gradient {
+    height: 152px;
+  }
+
+  .legend.open {
+    height: 192px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-badge::before,
+  .wind-arrow,
+  .my-location-dot,
+  .refresh-btn.spinning svg {
+    animation: none !important;
+  }
+}

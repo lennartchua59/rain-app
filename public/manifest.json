@@ -1,0 +1,15 @@
+{
+  "name": "Singapore Rain Radar",
+  "short_name": "Rain Radar",
+  "start_url": "/",
+  "display": "fullscreen",
+  "background_color": "#0a0d12",
+  "theme_color": "#0a0d12",
+  "icons": [
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

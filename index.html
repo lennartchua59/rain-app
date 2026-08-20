@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <!-- Deliberately NO viewport-fit=cover. With it, a home-screen launch gets a
+         layout viewport 62pt shorter than the screen that WebKit still pins to
+         y=0, stranding a 62pt dead strip along the bottom edge. Without it the
+         page is laid out below the status bar and reaches the bottom edge, which
+         is why the footer now sits flush. Verified in the iOS Simulator. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#0a0d12" />
+    <!-- Without these, iOS paints an opaque bar over the status-bar area for a
+         home-screen web app instead of letting the page render behind it
+         (translucent), which looks like a solid black gap at the top. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="description" content="Singapore rain radar — see past and forecast rainfall movement to plan your cycling route." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Nunito+Sans:wght@400;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <title>Singapore Rain Radar</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
