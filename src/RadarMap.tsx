@@ -19,6 +19,25 @@ const KM_PER_DEG_LAT = 111
 // RainViewer's public composite only has native imagery up to this zoom for this
 // region; requesting deeper zooms returns a "Zoom Level Not Supported" placeholder.
 const RAINVIEWER_MAX_NATIVE_ZOOM = 7
+// The slippy-tile grid RainViewer serves on; z/x/y are identical whether the
+// 256px or 512px asset is requested, so this never changes.
+const RAINVIEWER_GRID_SIZE = 256
+// RainViewer's own web/app client requests the 512px (@2x) render of that same
+// grid on hi-DPI displays (their bundle: tileSize = (isRetina ? 2 : 1) * 256),
+// which is four times the pixels per cell. Matching it is the single biggest
+// fidelity win available on the past/live path.
+const RAINVIEWER_TILE_SIZE = 512
+// The opacity RainViewer's own client defaults to for the radar layer
+// (their bundle: opacity ?? 83, divided by 100). MSS keeps its own value.
+const RAINVIEWER_LAYER_OPACITY = 0.83
+// Their pre-coloured tile endpoint ignores this value entirely — schemes
+// 0/1/2/4/8/9 all return byte-identical PNGs, so only the `smooth_snow`
+// suffix actually changes anything here. (Their app passes 255 instead, which
+// returns raw dBZ-encoded tiles it colours itself in a MapLibre shader; that
+// path needs WebGL and isn't reproducible with plain Leaflet raster tiles.)
+// Kept as a named constant so the URL shape stays obvious, and set to the
+// smooth+snow combination their client defaults to.
+const RAINVIEWER_TILE_STYLE = '4/1_1'
 // A published nowcast frame is only trusted for offsets within this many
 // minutes of its own timestamp, so we don't stretch a 10-min-interval frame
 // too far. RainViewer's frames normally land on a 10-min grid, so any point
@@ -59,9 +78,35 @@ const RV_MIN_TILE_X = lonToTileX(MSS_SOUTH_WEST[1], RAINVIEWER_MAX_NATIVE_ZOOM) 
 const RV_MAX_TILE_X = lonToTileX(MSS_NORTH_EAST[1], RAINVIEWER_MAX_NATIVE_ZOOM) + RAINVIEWER_TILE_PADDING
 const RV_MIN_TILE_Y = latToTileY(MSS_NORTH_EAST[0], RAINVIEWER_MAX_NATIVE_ZOOM) - RAINVIEWER_TILE_PADDING
 const RV_MAX_TILE_Y = latToTileY(MSS_SOUTH_WEST[0], RAINVIEWER_MAX_NATIVE_ZOOM) + RAINVIEWER_TILE_PADDING
-const RAINVIEWER_STITCH_BOUNDS = L.latLngBounds(
-  [tileYToLat(RV_MAX_TILE_Y + 1, RAINVIEWER_MAX_NATIVE_ZOOM), tileXToLon(RV_MIN_TILE_X, RAINVIEWER_MAX_NATIVE_ZOOM)],
-  [tileYToLat(RV_MIN_TILE_Y, RAINVIEWER_MAX_NATIVE_ZOOM), tileXToLon(RV_MAX_TILE_X + 1, RAINVIEWER_MAX_NATIVE_ZOOM)],
+
+// Full stitched raster size, known up front from the tile grid.
+const RV_STITCH_W = (RV_MAX_TILE_X - RV_MIN_TILE_X + 1) * RAINVIEWER_TILE_SIZE
+const RV_STITCH_H = (RV_MAX_TILE_Y - RV_MIN_TILE_Y + 1) * RAINVIEWER_TILE_SIZE
+// One z7 tile is ~313km, so padding a 60km-wide bounding box by a whole tile
+// on every side yields a ~1250x940km raster to display a ~300km view. Spending
+// the nowcast's pixel budget on that much off-screen area is what left the
+// future layer looking soft next to the crisp live tiles, so everything from
+// the analysis onward works on this centred square window instead. It still
+// comfortably covers the viewport with room to pan.
+const RV_WINDOW = {
+  size: Math.round(Math.min(RV_STITCH_W, RV_STITCH_H) * 0.5),
+  get x() {
+    return Math.round((RV_STITCH_W - this.size) / 2)
+  },
+  get y() {
+    return Math.round((RV_STITCH_H - this.size) / 2)
+  },
+}
+// Exact geographic bounds of that window, via fractional tile coordinates.
+const RAINVIEWER_WINDOW_BOUNDS = L.latLngBounds(
+  [
+    tileYToLat(RV_MIN_TILE_Y + (RV_WINDOW.y + RV_WINDOW.size) / RAINVIEWER_TILE_SIZE, RAINVIEWER_MAX_NATIVE_ZOOM),
+    tileXToLon(RV_MIN_TILE_X + RV_WINDOW.x / RAINVIEWER_TILE_SIZE, RAINVIEWER_MAX_NATIVE_ZOOM),
+  ],
+  [
+    tileYToLat(RV_MIN_TILE_Y + RV_WINDOW.y / RAINVIEWER_TILE_SIZE, RAINVIEWER_MAX_NATIVE_ZOOM),
+    tileXToLon(RV_MIN_TILE_X + (RV_WINDOW.x + RV_WINDOW.size) / RAINVIEWER_TILE_SIZE, RAINVIEWER_MAX_NATIVE_ZOOM),
+  ],
 )
 
 // MSS's own color ramp for the rain-area product, light -> heavy.
@@ -77,10 +122,12 @@ const INTENSITY_COLORS = [
   '#DD1423',
 ]
 
-// Approximation of RainViewer's own "colorScheme 4" (their default web/app
-// palette) ramp, light -> heavy, for the legend when the RainViewer source is
-// selected — their tile colors don't come from a published stop list, so this
-// is read off their rendered tiles rather than an official spec.
+// Approximation of the ramp RainViewer's pre-coloured tiles actually use,
+// light -> heavy, for the legend when the RainViewer source is selected. Their
+// tile colours don't come from a published stop list, so this is read off the
+// rendered tiles rather than an official spec — and note the scheme number in
+// the tile URL has no effect on what comes back (see RAINVIEWER_TILE_STYLE),
+// so there is only ever this one palette to match.
 const RAINVIEWER_INTENSITY_COLORS = [
   '#5AD0F0',
   '#3B9EE5',
@@ -384,6 +431,15 @@ function nowcastFade(minutes: number) {
   return Math.max(0.2, 1 - (minutes / FUTURE_MINUTES) * 0.75)
 }
 
+// Gentler equivalent for the advected path, whose per-cell growth/decay
+// already removes intensity where the field is genuinely weakening. Fading
+// the layer as hard as nowcastFade does on top of that decays everything
+// twice, which is what made long lead times look washed out rather than
+// forecast.
+function evolvedNowcastFade(minutes: number) {
+  return Math.max(0.55, 1 - (minutes / FUTURE_MINUTES) * 0.35)
+}
+
 // Georeferenced, single-image radar overlay for one point in time. Crossfades by
 // preloading the next frame fully before swapping — the outgoing frame fades OUT
 // at the same time the incoming one fades IN (both held on the map together for
@@ -577,23 +633,79 @@ function uniformDriftFromStationAverage(windField: WindField): DriftSource {
 // native tile resolution on purpose — keeps the O(size^2 * radius^2) search
 // fast — with a parabolic sub-pixel refinement afterward to claw back
 // precision the downsampling would otherwise lose.
-const MOTION_GRID_SIZE = 96
-const MOTION_SEARCH_RADIUS = 10
+const MOTION_GRID_SIZE = 160
+// At ~2.9km per analysis cell over a 30-min baseline, this covers storm
+// motion up to roughly 70km/h — comfortably above anything tropical
+// convection does here, and the search cost grows with its square.
+const MOTION_SEARCH_RADIUS = 12
+// The raster handed to the analysis has already been cut down to RV_WINDOW,
+// so no further cropping is needed here — measuring across the untrimmed
+// ~1250km stitch would put ~13km in every grid cell, and ten minutes of storm
+// motion lands well inside a single cell and correlates to exactly zero. On
+// the windowed raster a cell is ~3km, where real motion is resolvable.
+const MOTION_CROP_FRACTION = 1
+// Target gap between the two frames compared. Consecutive frames are 10 min
+// apart, which is too short for slow-moving equatorial convection to shift
+// measurably; a wider baseline gives both the motion search and the
+// growth/decay ratio a far better signal-to-noise ratio.
+const MOTION_BASELINE_MIN = 30
 // The best integer shift must beat "no motion at all" by at least this
 // fraction of the zero-shift error before it's trusted — guards against
 // chasing noise when the frame is mostly empty (no coherent rain pattern) or
 // truly hasn't moved.
 const MOTION_CONFIDENCE_MARGIN = 0.02
 
-// Downsamples a canvas to a small grayscale intensity grid for the motion
-// search below. Transparent pixels (no rain) are treated as zero intensity.
-function toMotionGrid(source: CanvasImageSource, size: number): Float32Array | null {
+// Resolution of the dense motion (flow) field laid over the frame. A single
+// global vector makes the whole map slide like one rigid sheet, which is the
+// main reason a pure-translation nowcast reads as fake — real echo fields
+// shear, rotate and move at different speeds in different places. Each cell
+// here gets its own vector, refined locally around the global estimate.
+const FLOW_GRID_SIZE = 16
+// Half-width (in motion-grid pixels) of the correlation window each flow cell
+// matches on. Wider than the cell itself so neighbouring windows overlap,
+// which keeps the recovered field continuous instead of tiled.
+const FLOW_BLOCK_HALF = 8
+// How far each cell may disagree with the global vector, in motion-grid
+// pixels. Deliberately small — local motion is a correction to the dominant
+// storm motion, not an independent search, so noise can't send one cell
+// flying off in its own direction.
+const FLOW_LOCAL_RADIUS = 4
+// Below this mean intensity a flow cell has too little rain to match on, and
+// simply inherits the global vector.
+const FLOW_SIGNAL_FLOOR = 4
+// Smoothing passes over the recovered field. Regularisation: neighbouring
+// cells should mostly agree, and this removes the isolated bad matches that
+// would otherwise tear the image during advection.
+const FLOW_SMOOTH_PASSES = 2
+// Backward-trajectory integration steps. With a spatially varying field a
+// single jump is only first-order accurate; stepping the trajectory back in
+// pieces lets curvature and rotation actually develop over long lead times.
+const ADVECT_SUBSTEPS = 3
+// Longest edge of the advected output raster. Caps per-frame render cost so
+// scrubbing and playback stay responsive.
+const ADVECT_MAX_DIM = 1024
+
+// The square window (in source-raster pixels) that motion and growth are
+// measured on, so the analysis grid can be mapped back onto the full raster.
+type MotionCrop = { x: number; y: number; size: number }
+
+// Centred square crop of the raster used for analysis. Square on purpose: the
+// stitch is wider than it is tall, and squashing that into a square grid gives
+// x and y different km-per-cell scales, which skews every recovered vector.
+function motionCropFor(w: number, h: number): MotionCrop {
+  const size = Math.round(Math.min(w, h) * MOTION_CROP_FRACTION)
+  return { x: Math.round((w - size) / 2), y: Math.round((h - size) / 2), size }
+}
+
+// Downsamples the crop window of a canvas to a small grayscale intensity grid
+// for the motion search below. Transparent pixels (no rain) are zero.
+function toMotionGrid(source: CanvasImageSource, size: number, crop: MotionCrop): Float32Array | null {
   const c = document.createElement('canvas')
   c.width = size
   c.height = size
   const ctx = c.getContext('2d')
   if (!ctx) return null
-  ctx.drawImage(source, 0, 0, size, size)
+  ctx.drawImage(source, crop.x, crop.y, crop.size, crop.size, 0, 0, size, size)
   let data: Uint8ClampedArray
   try {
     data = ctx.getImageData(0, 0, size, size).data
@@ -619,7 +731,7 @@ function estimateGridShift(
   curr: Float32Array,
   size: number,
   radius: number,
-): { dx: number; dy: number } | null {
+): { dx: number; dy: number; confident: boolean } | null {
   const span = radius * 2 + 1
   const errGrid = new Float32Array(span * span).fill(Infinity)
   let bestErr = Infinity
@@ -658,7 +770,13 @@ function estimateGridShift(
 
   const zeroErr = errGrid[radius * span + radius]
   if (!Number.isFinite(bestErr) || !Number.isFinite(zeroErr) || zeroErr === 0) return null
-  if ((zeroErr - bestErr) / zeroErr < MOTION_CONFIDENCE_MARGIN) return null
+  // A weak margin means "this field isn't coherently translating", which for
+  // slow-moving equatorial convection is the correct answer, not a failure.
+  // Report it as near-zero motion and let growth/decay carry the evolution —
+  // returning null here would drop the caller onto the uniform wind-drift
+  // slide, which is a strictly worse model of what's happening.
+  const confident = (zeroErr - bestErr) / zeroErr >= MOTION_CONFIDENCE_MARGIN
+  if (!confident) return { dx: 0, dy: 0, confident: false }
 
   // Parabolic sub-pixel refinement using the immediate neighbors of the best
   // integer shift, independently in each axis.
@@ -677,7 +795,182 @@ function estimateGridShift(
     if (Number.isFinite(eT) && Number.isFinite(eB) && denom !== 0) subJ = bestJ + (0.5 * (eT - eB)) / denom
   }
 
-  return { dx: subI - radius, dy: subJ - radius }
+  return { dx: subI - radius, dy: subJ - radius, confident: true }
+}
+
+// A dense motion field over the frame, in motion-grid pixels per frame
+// interval. `u` is rightward (east), `v` is downward (south, i.e. increasing
+// row index) so it composes directly with image coordinates.
+type FlowField = { u: Float32Array; v: Float32Array; size: number }
+
+// Recovers a per-cell motion field by matching a window around each flow cell
+// between the two frames, searching only a small neighbourhood around the
+// already-known global vector. Cells without enough rain to match on inherit
+// the global vector, so empty sky never invents its own motion.
+function estimateFlowField(
+  prev: Float32Array,
+  curr: Float32Array,
+  size: number,
+  globalDx: number,
+  globalDy: number,
+): FlowField {
+  const n = FLOW_GRID_SIZE
+  const u = new Float32Array(n * n)
+  const v = new Float32Array(n * n)
+  const baseDx = Math.round(globalDx)
+  const baseDy = Math.round(globalDy)
+  const span = FLOW_LOCAL_RADIUS * 2 + 1
+  const errs = new Float32Array(span * span)
+
+  for (let fy = 0; fy < n; fy++) {
+    for (let fx = 0; fx < n; fx++) {
+      const cx = Math.round(((fx + 0.5) * size) / n)
+      const cy = Math.round(((fy + 0.5) * size) / n)
+      const x0 = Math.max(0, cx - FLOW_BLOCK_HALF)
+      const x1 = Math.min(size - 1, cx + FLOW_BLOCK_HALF)
+      const y0 = Math.max(0, cy - FLOW_BLOCK_HALF)
+      const y1 = Math.min(size - 1, cy + FLOW_BLOCK_HALF)
+
+      // Not enough signal in this window to match on — inherit global motion.
+      let signal = 0
+      let cells = 0
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          signal += curr[y * size + x]
+          cells++
+        }
+      }
+      const idx = fy * n + fx
+      if (cells === 0 || signal / cells < FLOW_SIGNAL_FLOOR) {
+        u[idx] = globalDx
+        v[idx] = globalDy
+        continue
+      }
+
+      errs.fill(Infinity)
+      let bestErr = Infinity
+      let bestI = FLOW_LOCAL_RADIUS
+      let bestJ = FLOW_LOCAL_RADIUS
+      for (let j = 0; j < span; j++) {
+        const dy = baseDy + (j - FLOW_LOCAL_RADIUS)
+        for (let i = 0; i < span; i++) {
+          const dx = baseDx + (i - FLOW_LOCAL_RADIUS)
+          let sum = 0
+          let count = 0
+          for (let y = y0; y <= y1; y++) {
+            const py = y - dy
+            if (py < 0 || py >= size) continue
+            for (let x = x0; x <= x1; x++) {
+              const px = x - dx
+              if (px < 0 || px >= size) continue
+              const diff = curr[y * size + x] - prev[py * size + px]
+              sum += diff * diff
+              count++
+            }
+          }
+          if (count < (x1 - x0 + 1) * (y1 - y0 + 1) * 0.5) continue
+          const err = sum / count
+          errs[j * span + i] = err
+          if (err < bestErr) {
+            bestErr = err
+            bestI = i
+            bestJ = j
+          }
+        }
+      }
+
+      if (!Number.isFinite(bestErr)) {
+        u[idx] = globalDx
+        v[idx] = globalDy
+        continue
+      }
+
+      // Same parabolic sub-pixel refinement as the global search, so the field
+      // varies smoothly rather than in whole-pixel steps.
+      let subI = bestI
+      let subJ = bestJ
+      if (bestI > 0 && bestI < span - 1) {
+        const eL = errs[bestJ * span + (bestI - 1)]
+        const eR = errs[bestJ * span + (bestI + 1)]
+        const denom = eL - 2 * bestErr + eR
+        if (Number.isFinite(eL) && Number.isFinite(eR) && denom !== 0) {
+          subI = bestI + (0.5 * (eL - eR)) / denom
+        }
+      }
+      if (bestJ > 0 && bestJ < span - 1) {
+        const eT = errs[(bestJ - 1) * span + bestI]
+        const eB = errs[(bestJ + 1) * span + bestI]
+        const denom = eT - 2 * bestErr + eB
+        if (Number.isFinite(eT) && Number.isFinite(eB) && denom !== 0) {
+          subJ = bestJ + (0.5 * (eT - eB)) / denom
+        }
+      }
+
+      u[idx] = baseDx + (subI - FLOW_LOCAL_RADIUS)
+      v[idx] = baseDy + (subJ - FLOW_LOCAL_RADIUS)
+    }
+  }
+
+  smoothFlowField(u, v, n, FLOW_SMOOTH_PASSES)
+  return { u, v, size: n }
+}
+
+// Box-smooths the flow field in place. Neighbouring cells describe the same
+// air mass and should largely agree; without this, one bad block match tears
+// a visible seam through the advected image.
+function smoothFlowField(u: Float32Array, v: Float32Array, n: number, passes: number) {
+  const tmpU = new Float32Array(u.length)
+  const tmpV = new Float32Array(v.length)
+  for (let p = 0; p < passes; p++) {
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        let su = 0
+        let sv = 0
+        let c = 0
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy
+          if (yy < 0 || yy >= n) continue
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx
+            if (xx < 0 || xx >= n) continue
+            su += u[yy * n + xx]
+            sv += v[yy * n + xx]
+            c++
+          }
+        }
+        tmpU[y * n + x] = su / c
+        tmpV[y * n + x] = sv / c
+      }
+    }
+    u.set(tmpU)
+    v.set(tmpV)
+  }
+}
+
+// Samples the flow field at fractional flow-grid coordinates, clamping at the
+// edges so trajectories leaving the domain still get a sensible vector.
+function sampleFlow(field: FlowField, fx: number, fy: number): { u: number; v: number } {
+  const n = field.size
+  const cx = Math.min(n - 1, Math.max(0, fx))
+  const cy = Math.min(n - 1, Math.max(0, fy))
+  const x0 = Math.floor(cx)
+  const y0 = Math.floor(cy)
+  const x1 = Math.min(x0 + 1, n - 1)
+  const y1 = Math.min(y0 + 1, n - 1)
+  const tx = cx - x0
+  const ty = cy - y0
+  const w00 = (1 - tx) * (1 - ty)
+  const w10 = tx * (1 - ty)
+  const w01 = (1 - tx) * ty
+  const w11 = tx * ty
+  const i00 = y0 * n + x0
+  const i10 = y0 * n + x1
+  const i01 = y1 * n + x0
+  const i11 = y1 * n + x1
+  return {
+    u: field.u[i00] * w00 + field.u[i10] * w10 + field.u[i01] * w01 + field.u[i11] * w11,
+    v: field.v[i00] * w00 + field.v[i10] * w10 + field.v[i01] * w01 + field.v[i11] * w11,
+  }
 }
 
 // Converts a pixel displacement measured between two frames spaced
@@ -727,13 +1020,18 @@ const GROWTH_SIGNAL_FLOOR = 8
 // Per-interval growth ratio is clamped to this range before extrapolation —
 // a single frame-to-frame comparison is noisy, so this keeps one outlier
 // interval from producing an absurd forward extrapolation.
+// Asymmetric on purpose. Decay extrapolates reasonably — a weakening cell
+// usually keeps weakening — but growth does not: a faint echo that happened to
+// brighten over one interval will not keep quadrupling, and letting it try
+// blooms noise into big soft blobs that read as obviously fake. So growth is
+// held on a much shorter leash than decay.
 const GROWTH_RATIO_MIN = 0.3
-const GROWTH_RATIO_MAX = 3
+const GROWTH_RATIO_MAX = 1.8
 // Final extrapolated growth factor (ratio raised to the lead-time power) is
 // clamped to this range — real cells don't sustain exponential growth for
 // two hours, and this keeps far-future frames from blowing out or vanishing.
 const GROWTH_FACTOR_MIN = 0.15
-const GROWTH_FACTOR_MAX = 4
+const GROWTH_FACTOR_MAX = 2
 // Caps how many "intervals" the growth ratio gets extrapolated across, so a
 // two-hour lead time (potentially 12+ ten-minute intervals) doesn't compound
 // a noisy per-interval ratio into an extreme value before the factor clamp
@@ -749,14 +1047,18 @@ function buildGrowthGrid(
   prevGrid: Float32Array,
   currGrid: Float32Array,
   size: number,
-  shiftDx: number,
-  shiftDy: number,
+  flow: FlowField,
 ): Float32Array {
   const out = new Float32Array(size * size)
+  const toFlow = flow.size / size
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const i = y * size + x
-      const prevVal = sampleGridBilinear(prevGrid, size, x - shiftDx, y - shiftDy)
+      // Compensate with this cell's own vector, not a single global shift, so
+      // sheared or rotating parts of the field are compared against the right
+      // upstream source rather than being misread as growth or decay.
+      const { u: fu, v: fv } = sampleFlow(flow, x * toFlow, y * toFlow)
+      const prevVal = sampleGridBilinear(prevGrid, size, x - fu, y - fv)
       const currVal = currGrid[i]
       if (prevVal === null || (prevVal < GROWTH_SIGNAL_FLOOR && currVal < GROWTH_SIGNAL_FLOOR)) {
         out[i] = 1
@@ -770,10 +1072,16 @@ function buildGrowthGrid(
 }
 
 type EchoEvolution = {
+  // Domain-average velocity, kept for the wind readout / debugging.
   motion: { u: number; v: number }
+  // Per-cell motion, in motion-grid pixels per frame interval. This is what
+  // actually drives advection.
+  flow: FlowField
   growthGrid: Float32Array
   gridSize: number
   dtMinutes: number
+  // Window of the source raster the grids above describe.
+  crop: MotionCrop
 }
 
 // Estimates how a RainViewer frame is actually evolving — both its overall
@@ -790,23 +1098,31 @@ function estimateEchoEvolution(
   dtMinutes: number,
 ): EchoEvolution | null {
   if (dtMinutes <= 0) return null
-  const prevGrid = toMotionGrid(prevCanvas, MOTION_GRID_SIZE)
-  const currGrid = toMotionGrid(currCanvas, MOTION_GRID_SIZE)
+  const crop = motionCropFor(currCanvas.width, currCanvas.height)
+  const prevGrid = toMotionGrid(prevCanvas, MOTION_GRID_SIZE, crop)
+  const currGrid = toMotionGrid(currCanvas, MOTION_GRID_SIZE, crop)
   if (!prevGrid || !currGrid) return null
   const shift = estimateGridShift(prevGrid, currGrid, MOTION_GRID_SIZE, MOTION_SEARCH_RADIUS)
+  // Only a genuinely degenerate frame (no data at all) gives up here. A
+  // low-confidence result still yields a valid evolution built around
+  // near-zero motion, which is the honest answer for a field that is
+  // growing and decaying in place rather than moving.
   if (!shift) return null
-  const scaleX = currCanvas.width / MOTION_GRID_SIZE
-  const scaleY = currCanvas.height / MOTION_GRID_SIZE
+  // Crop pixels are square, so one scale covers both axes.
+  const scale = crop.size / MOTION_GRID_SIZE
   const motion = pixelShiftToVelocity(
-    shift.dx * scaleX,
-    shift.dy * scaleY,
+    shift.dx * scale,
+    shift.dy * scale,
     bounds,
     currCanvas.width,
     currCanvas.height,
     dtMinutes,
   )
-  const growthGrid = buildGrowthGrid(prevGrid, currGrid, MOTION_GRID_SIZE, shift.dx, shift.dy)
-  return { motion, growthGrid, gridSize: MOTION_GRID_SIZE, dtMinutes }
+  // The global vector above is only the prior; the field below is what the
+  // frame actually did, cell by cell.
+  const flow = estimateFlowField(prevGrid, currGrid, MOTION_GRID_SIZE, shift.dx, shift.dy)
+  const growthGrid = buildGrowthGrid(prevGrid, currGrid, MOTION_GRID_SIZE, flow)
+  return { motion, flow, growthGrid, gridSize: MOTION_GRID_SIZE, dtMinutes, crop }
 }
 
 // Renders a future frame from measured echo motion AND per-region growth —
@@ -820,62 +1136,97 @@ function renderEchoEvolutionFrame(
   source: ImageData,
   w: number,
   h: number,
-  bounds: L.LatLngBounds,
   evolution: EchoEvolution,
   offsetMinutes: number,
 ) {
-  canvas.width = w
-  canvas.height = h
   const ctx = canvas.getContext('2d')
   if (!ctx) return
 
   if (offsetMinutes <= 0) {
+    canvas.width = w
+    canvas.height = h
     ctx.putImageData(source, 0, 0)
     return
   }
 
-  const sw = bounds.getSouthWest()
-  const ne = bounds.getNorthEast()
-  const degLat = ne.lat - sw.lat
-  const degLon = ne.lng - sw.lng
-  const centerLat = (sw.lat + ne.lat) / 2
-  const pxPerDegLat = h / degLat
-  const pxPerDegLon = w / degLon
+  // Advection runs per output pixel, so the full 2048x1536 raster costs ~270ms
+  // a frame — far too slow to scrub or animate. The canvas's on-screen size is
+  // set separately by the layer's reposition handler, so shrinking the backing
+  // store just lowers the render resolution, and this layer is already given a
+  // slight blur for lead-time uncertainty, which hides the difference.
+  const renderScale = Math.max(1, Math.max(w, h) / ADVECT_MAX_DIM)
+  const outW = Math.max(1, Math.round(w / renderScale))
+  const outH = Math.max(1, Math.round(h / renderScale))
+  canvas.width = outW
+  canvas.height = outH
 
-  const distanceKmU = evolution.motion.u * (offsetMinutes / 60)
-  const distanceKmV = evolution.motion.v * (offsetMinutes / 60)
-  const dxPx = Math.round((distanceKmU / KM_PER_DEG_LAT / Math.cos((centerLat * Math.PI) / 180)) * pxPerDegLon)
-  // Northward (+v) motion moves content toward smaller row indices (up).
-  const dyPx = Math.round(-(distanceKmV / KM_PER_DEG_LAT) * pxPerDegLat)
+  const { growthGrid, gridSize, flow, crop } = evolution
+  // How many frame intervals forward we're extrapolating. Both the trajectory
+  // length and the growth exponent scale with this.
+  const steps = offsetMinutes / evolution.dtMinutes
+  const growthPower = Math.min(GROWTH_POWER_CAP, steps)
 
-  const growthPower = Math.min(GROWTH_POWER_CAP, offsetMinutes / evolution.dtMinutes)
-  const { growthGrid, gridSize } = evolution
-  const gridScaleX = w / gridSize
-  const gridScaleY = h / gridSize
+  // The grids describe the crop window, not the whole raster, so image pixels
+  // are mapped through it. Outside the window the samplers clamp to the edge,
+  // which extends the nearest measured behaviour rather than snapping to "no
+  // motion, no growth" and leaving a seam at the boundary.
+  const pxPerGrid = crop.size / gridSize
+  const toFlow = flow.size / crop.size
+
+  const substeps = Math.max(1, ADVECT_SUBSTEPS)
+  const stepFrac = steps / substeps
 
   const src = source.data
-  const out = ctx.createImageData(w, h)
+  const out = ctx.createImageData(outW, outH)
   const dst = out.data
 
-  for (let y = 0; y < h; y++) {
-    const srcY = y - dyPx
-    if (srcY < 0 || srcY >= h) continue
-    const gy = Math.min(gridSize - 1, Math.max(0, Math.floor(srcY / gridScaleY)))
-    const rowOff = y * w
-    const srcRowOff = srcY * w
-    for (let x = 0; x < w; x++) {
-      const srcX = x - dxPx
-      if (srcX < 0 || srcX >= w) continue
-      const gx = Math.min(gridSize - 1, Math.max(0, Math.floor(srcX / gridScaleX)))
-      const ratio = growthGrid[gy * gridSize + gx]
+  for (let oy = 0; oy < outH; oy++) {
+    const rowOff = oy * outW
+    for (let ox = 0; ox < outW; ox++) {
+      // Walk this destination pixel backwards along the flow to find where its
+      // rain came from. Integrating in substeps (rather than one jump) is what
+      // lets curved and rotating trajectories develop instead of every pixel
+      // travelling in a straight line. Trajectories are traced in full-raster
+      // coordinates even when the output is downscaled.
+      let sx = ox * renderScale
+      let sy = oy * renderScale
+      for (let s = 0; s < substeps; s++) {
+        const f = sampleFlow(flow, (sx - crop.x) * toFlow, (sy - crop.y) * toFlow)
+        sx -= f.u * pxPerGrid * stepFrac
+        sy -= f.v * pxPerGrid * stepFrac
+      }
+      if (sx < 0 || sy < 0 || sx > w - 1 || sy > h - 1) continue
+
+      // Growth measured at the upstream location, so a cell carries its own
+      // trend along with it rather than picking up wherever it lands.
+      const gx = Math.min(gridSize - 1, Math.max(0, (sx - crop.x) / pxPerGrid))
+      const gy = Math.min(gridSize - 1, Math.max(0, (sy - crop.y) / pxPerGrid))
+      const ratio = sampleGridBilinear(growthGrid, gridSize, gx, gy) ?? 1
       const growth = Math.min(GROWTH_FACTOR_MAX, Math.max(GROWTH_FACTOR_MIN, Math.pow(ratio, growthPower)))
 
-      const si = (srcRowOff + srcX) * 4
-      const di = (rowOff + x) * 4
-      dst[di] = src[si]
-      dst[di + 1] = src[si + 1]
-      dst[di + 2] = src[si + 2]
-      dst[di + 3] = Math.min(255, src[si + 3] * growth)
+      // Bilinear fetch of the source pixel — sub-pixel sampling is what turns
+      // the old pixel-snapping slide into continuous glide as you scrub.
+      const x0 = Math.floor(sx)
+      const y0 = Math.floor(sy)
+      const x1 = Math.min(x0 + 1, w - 1)
+      const y1 = Math.min(y0 + 1, h - 1)
+      const tx = sx - x0
+      const ty = sy - y0
+      const w00 = (1 - tx) * (1 - ty)
+      const w10 = tx * (1 - ty)
+      const w01 = (1 - tx) * ty
+      const w11 = tx * ty
+      const i00 = (y0 * w + x0) * 4
+      const i10 = (y0 * w + x1) * 4
+      const i01 = (y1 * w + x0) * 4
+      const i11 = (y1 * w + x1) * 4
+
+      const di = (rowOff + ox) * 4
+      dst[di] = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11
+      dst[di + 1] = src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11
+      dst[di + 2] = src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11
+      const a = src[i00 + 3] * w00 + src[i10 + 3] * w10 + src[i01 + 3] * w01 + src[i11 + 3] * w11
+      dst[di + 3] = Math.min(255, a * growth)
     }
   }
 
@@ -990,8 +1341,7 @@ function LiquidNowcastLayer({
 // station wind average, with no growth/decay term, when that measurement
 // isn't available or isn't confident. RainViewer only serves a slippy tile
 // grid, so each frame's raster is stitched from a small grid of tiles around
-// SG/JB first (see RAINVIEWER_STITCH_BOUNDS) rather than loaded as one image
-// like MSS's composite.
+// SG/JB first rather than loaded as one image like MSS's composite.
 function RainviewerLiquidNowcastLayer({
   host,
   pastFrames,
@@ -999,7 +1349,7 @@ function RainviewerLiquidNowcastLayer({
   offsetMinutes,
   opacity,
   visible,
-  colorScheme = '4/1_1',
+  colorScheme = RAINVIEWER_TILE_STYLE,
 }: {
   host: string | null
   pastFrames: RainviewerFrame[]
@@ -1018,7 +1368,26 @@ function RainviewerLiquidNowcastLayer({
   const [stitchReady, setStitchReady] = useState(0)
 
   const latest = pastFrames.length > 0 ? pastFrames[pastFrames.length - 1] : null
-  const previous = pastFrames.length > 1 ? pastFrames[pastFrames.length - 2] : null
+  // Not simply the frame before `latest`: consecutive frames are 10 min apart,
+  // and over that gap slow-moving convection shifts by less than one analysis
+  // cell, so the correlation returns exactly zero every time. Comparing across
+  // ~MOTION_BASELINE_MIN gives motion and growth something measurable to work
+  // with. Falls back to the immediately-previous frame early in the feed.
+  const previous = useMemo(() => {
+    if (!latest || pastFrames.length < 2) return null
+    const targetTime = latest.time - MOTION_BASELINE_MIN * 60
+    let best: RainviewerFrame | null = null
+    let bestDiff = Infinity
+    for (const f of pastFrames) {
+      if (f.time >= latest.time) continue
+      const diff = Math.abs(f.time - targetTime)
+      if (diff < bestDiff) {
+        bestDiff = diff
+        best = f
+      }
+    }
+    return best
+  }, [pastFrames, latest])
 
   useEffect(() => {
     const canvas = L.DomUtil.create('canvas', 'radar-image') as HTMLCanvasElement
@@ -1028,8 +1397,8 @@ function RainviewerLiquidNowcastLayer({
     canvasRef.current = canvas
 
     const reposition = () => {
-      const topLeft = map.latLngToLayerPoint(RAINVIEWER_STITCH_BOUNDS.getNorthWest())
-      const bottomRight = map.latLngToLayerPoint(RAINVIEWER_STITCH_BOUNDS.getSouthEast())
+      const topLeft = map.latLngToLayerPoint(RAINVIEWER_WINDOW_BOUNDS.getNorthWest())
+      const bottomRight = map.latLngToLayerPoint(RAINVIEWER_WINDOW_BOUNDS.getSouthEast())
       const size = bottomRight.subtract(topLeft)
       canvas.style.width = `${size.x}px`
       canvas.style.height = `${size.y}px`
@@ -1060,19 +1429,23 @@ function RainviewerLiquidNowcastLayer({
       const cols = RV_MAX_TILE_X - RV_MIN_TILE_X + 1
       const rows = RV_MAX_TILE_Y - RV_MIN_TILE_Y + 1
       const stitch = document.createElement('canvas')
-      stitch.width = cols * 256
-      stitch.height = rows * 256
+      stitch.width = cols * RAINVIEWER_TILE_SIZE
+      stitch.height = rows * RAINVIEWER_TILE_SIZE
       const ctx = stitch.getContext('2d')!
       const loads: Promise<void>[] = []
       for (let ty = RV_MIN_TILE_Y; ty <= RV_MAX_TILE_Y; ty++) {
         for (let tx = RV_MIN_TILE_X; tx <= RV_MAX_TILE_X; tx++) {
-          const url = `${host}${frame.path}/256/${RAINVIEWER_MAX_NATIVE_ZOOM}/${tx}/${ty}/${colorScheme}.png`
+          const url = `${host}${frame.path}/${RAINVIEWER_TILE_SIZE}/${RAINVIEWER_MAX_NATIVE_ZOOM}/${tx}/${ty}/${colorScheme}.png`
           loads.push(
             new Promise((resolve) => {
               const img = new Image()
               img.crossOrigin = 'anonymous'
               img.onload = () => {
-                ctx.drawImage(img, (tx - RV_MIN_TILE_X) * 256, (ty - RV_MIN_TILE_Y) * 256)
+                ctx.drawImage(
+                  img,
+                  (tx - RV_MIN_TILE_X) * RAINVIEWER_TILE_SIZE,
+                  (ty - RV_MIN_TILE_Y) * RAINVIEWER_TILE_SIZE,
+                )
                 resolve()
               }
               img.onerror = () => resolve()
@@ -1082,7 +1455,27 @@ function RainviewerLiquidNowcastLayer({
         }
       }
       await Promise.all(loads)
-      return stitch
+      // Hand back only the centred window. Everything downstream — motion,
+      // growth and the rendered frame itself — then works at ~2.7x the
+      // effective resolution over the area actually on screen, instead of
+      // spending most of its pixels on off-screen ocean.
+      const windowed = document.createElement('canvas')
+      windowed.width = RV_WINDOW.size
+      windowed.height = RV_WINDOW.size
+      windowed
+        .getContext('2d')!
+        .drawImage(
+          stitch,
+          RV_WINDOW.x,
+          RV_WINDOW.y,
+          RV_WINDOW.size,
+          RV_WINDOW.size,
+          0,
+          0,
+          RV_WINDOW.size,
+          RV_WINDOW.size,
+        )
+      return windowed
     }
 
     ;(async () => {
@@ -1094,7 +1487,7 @@ function RainviewerLiquidNowcastLayer({
         const previousStitch = await stitchFrame(previous)
         if (cancelled) return
         const dtMinutes = (latest.time - previous.time) / 60
-        evolution = estimateEchoEvolution(previousStitch, latestStitch, RAINVIEWER_STITCH_BOUNDS, dtMinutes)
+        evolution = estimateEchoEvolution(previousStitch, latestStitch, RAINVIEWER_WINDOW_BOUNDS, dtMinutes)
       }
 
       // Growth/decay extrapolation needs real pixel access to the displayed
@@ -1129,13 +1522,23 @@ function RainviewerLiquidNowcastLayer({
     const evolution = evolutionRef.current
     const sourceData = sourceDataRef.current
     if (evolution && sourceData) {
-      renderEchoEvolutionFrame(canvas, sourceData, stitch.width, stitch.height, RAINVIEWER_STITCH_BOUNDS, evolution, offsetMinutes)
+      renderEchoEvolutionFrame(canvas, sourceData, stitch.width, stitch.height, evolution, offsetMinutes)
     } else {
       const drift: DriftSource | null = windField ? uniformDriftFromStationAverage(windField) : null
-      renderWindDriftFrame(canvas, stitch, stitch.width, stitch.height, RAINVIEWER_STITCH_BOUNDS, drift, offsetMinutes)
+      renderWindDriftFrame(canvas, stitch, stitch.width, stitch.height, RAINVIEWER_WINDOW_BOUNDS, drift, offsetMinutes)
     }
-    canvas.style.filter = `blur(${(offsetMinutes / FUTURE_MINUTES) * 3}px)`
-    canvas.style.opacity = String(opacity * nowcastFade(offsetMinutes))
+    if (evolution && sourceData) {
+      // The advected path models decay per cell, so it doesn't need the heavy
+      // global blur-and-dim the wind-drift path uses to signal uncertainty —
+      // stacking both on top of it just reads as "the picture is fading out"
+      // rather than as weather. A light touch still conveys lead-time
+      // uncertainty without flattening the structure.
+      canvas.style.filter = `blur(${(offsetMinutes / FUTURE_MINUTES) * 1.2}px)`
+      canvas.style.opacity = String(opacity * evolvedNowcastFade(offsetMinutes))
+    } else {
+      canvas.style.filter = `blur(${(offsetMinutes / FUTURE_MINUTES) * 3}px)`
+      canvas.style.opacity = String(opacity * nowcastFade(offsetMinutes))
+    }
   }, [stitchReady, windField, offsetMinutes, opacity, visible])
 
   useEffect(() => {
@@ -1155,7 +1558,7 @@ function RainviewerNowcastLayer({
   frame,
   opacity,
   visible,
-  colorScheme = '4/1_1',
+  colorScheme = RAINVIEWER_TILE_STYLE,
 }: {
   host: string | null
   frame: RainviewerFrame | null
@@ -1211,11 +1614,17 @@ function RainviewerNowcastLayer({
     let layer = cache.get(cacheKey)
     let freshlyCreated = false
     if (!layer) {
-      const url = `${host}${frame.path}/256/{z}/{x}/{y}/${colorScheme}.png`
+      const url = `${host}${frame.path}/${RAINVIEWER_TILE_SIZE}/{z}/{x}/{y}/${colorScheme}.png`
       layer = L.tileLayer(url, {
         opacity: 0,
         zIndex: 18,
-        tileSize: 256,
+        // Stays 256 even though the URL asks for 512px images: RainViewer's
+        // /512/ endpoint is a @2x render of the *same* z/x/y grid, not a
+        // coarser 512-tile scheme. Telling Leaflet 512 here would halve the
+        // effective zoom and slide the radar off the coastline; leaving it at
+        // 256 keeps the grid identical and just packs 4x the pixels into each
+        // cell, which is what makes it look sharp on a hi-DPI screen.
+        tileSize: RAINVIEWER_GRID_SIZE,
         maxNativeZoom: RAINVIEWER_MAX_NATIVE_ZOOM,
         minNativeZoom: 2,
         className: 'radar-image',
@@ -1473,8 +1882,11 @@ export default function RadarMap() {
   const [playing, setPlaying] = useState(false)
   const [playbackRate, setPlaybackRate] = useState(1)
   // Fixed rather than user-adjustable — one less control cluttering the screen.
-  const opacity = 0.92
+  // GLOBAL matches the value RainViewer's own client ships with so the layer
+  // sits over the basemap exactly as it does in their app; MSS keeps the
+  // slightly stronger value its thinner composite needs to stay readable.
   const [radarSource, setRadarSource] = useState<RadarSource>('mss')
+  const opacity = radarSource === 'rainviewer' ? RAINVIEWER_LAYER_OPACITY : 0.92
   const [windVisible, setWindVisible] = useState(true)
   const [legendOpen, setLegendOpen] = useState(false)
   // Bumping this re-runs every live-data effect below immediately, for the
