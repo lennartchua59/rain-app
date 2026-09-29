@@ -34,12 +34,12 @@
   /* Space the floating chips (zoom control, tool stack, legend) must clear so
      they stack above the control island instead of sliding underneath it —
      island bottom offset + its own height + a breathing gap. */
-  --island-clear: calc(128px + env(safe-area-inset-bottom));
+  --island-clear: calc(156px + env(safe-area-inset-bottom));
 }
 
 @media (display-mode: standalone), (display-mode: fullscreen) {
   :root {
-    --island-clear: 144px;
+    --island-clear: 172px;
   }
 }
 
@@ -636,7 +636,7 @@
   justify-content: center;
   gap: 7px;
   min-width: 0;
-  margin: 2px 0 4px;
+  margin: 7px 0 10px;
   font-family: var(--font-display);
   font-size: 11px;
   font-weight: 600;
