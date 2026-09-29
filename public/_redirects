@@ -1,0 +1,4 @@
+# Serve MSS radar images from our own origin so the app can read their pixels
+# for motion tracking (MSS only allows its own site to). Mirrors the dev proxy
+# in vite.config.ts.
+/mss-radar/*  https://www.weather.gov.sg/files/rainarea/:splat  200

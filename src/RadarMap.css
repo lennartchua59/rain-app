@@ -147,17 +147,16 @@
   font-family: var(--font-display);
 }
 
-/* Positron's tiles are a light basemap with subtle color (pale blue water,
-   pale green parks, near-white land/roads) — invert(1) hue-rotate(180deg)
-   flips lightness into a dark theme while rotating each hue back to where it
+/* Positron is a light basemap with subtle color (pale blue water, pale green
+   parks, near-white land/roads) — invert(1) hue-rotate(180deg) flips
+   lightness into a dark theme while rotating each hue back to where it
    started, so water stays blue and parks stay green instead of everything
    going gray. A big saturate boost afterward brings those pale tints up to a
    readable dark blue/green since Positron's colors are faint to begin with;
-   contrast/brightness lift land off pure black. Scoped to the base tile
-   layer only (Leaflet applies this className per-tile), leaving the radar
-   overlay's own glow filter untouched. */
+   contrast/brightness lift land off pure black. Applied to the basemap's
+   canvas only, leaving the radar layers untouched. */
 .basemap-tile {
-  filter: invert(1) hue-rotate(180deg) contrast(1) brightness(2.4) saturate(2.4);
+  filter: invert(1) hue-rotate(180deg) contrast(1) brightness(2.1) saturate(2.4);
 }
 
 /* Small, unobtrusive credit for the free CARTO/OpenStreetMap tier — sits in
@@ -447,6 +446,14 @@
     drop-shadow(0 0 18px rgba(255, 196, 120, 0.45));
 }
 
+/* The motion-tracked radar canvas re-renders every animation frame, so it
+   deliberately skips the CSS glow filter above (the colour grade is baked into
+   its palette instead) — re-filtering a full-screen canvas per frame is what
+   would make playback stutter on phones. */
+.radar-flow-canvas {
+  pointer-events: none;
+}
+
 /* Incoming frame: starts slightly blurred and sharpens as it fades in, so
    consecutive frames feel like they're flowing/dissolving into each other
    rather than a flat crossfade. */
@@ -618,6 +625,53 @@
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+/* One quiet line saying where the frame on screen comes from and, for
+   anything extrapolated, how the motion was measured and how far to trust
+   it. Truncates rather than wrapping so the island never changes height. */
+.radar-note {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-width: 0;
+  margin: 2px 0 4px;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.radar-note-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.radar-note-confidence {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--bg-panel-strong);
+  font-weight: 800;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.radar-note-confidence.high {
+  color: var(--accent);
+}
+
+.radar-note-confidence.medium {
+  color: var(--accent-amber);
+}
+
+.radar-note-confidence.low {
+  color: var(--accent-red);
 }
 
 /* A slim outlined ring rather than a heavy filled disc — sized down from the

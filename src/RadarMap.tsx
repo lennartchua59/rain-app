@@ -1,8 +1,23 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
-import { MapContainer, TileLayer, useMap } from 'react-leaflet'
+import { MapContainer, useMap } from 'react-leaflet'
 import L from 'leaflet'
+import { maplibreGL } from '@maplibre/maplibre-gl-leaflet'
+import { setWorkerUrl } from 'maplibre-gl'
+// MapLibre decodes tiles in a separate worker file, which Vite's dependency
+// bundling otherwise loses; bundle it explicitly and tell MapLibre where it is.
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url'
 import 'leaflet/dist/leaflet.css'
+import 'maplibre-gl/dist/maplibre-gl.css'
 import './RadarMap.css'
+import {
+  FlowRadarLayer,
+  type FlowKeyframe,
+  type FlowSourceConfig,
+  type FlowStatus,
+  type MotionSource,
+  type SteeringWind,
+} from './radar/FlowRadarLayer'
+import { MSS_PALETTE, RAINVIEWER_PALETTE, legendStops } from './radar/palette'
 
 const SINGAPORE: [number, number] = [1.3521, 103.8198]
 
@@ -14,6 +29,22 @@ const MSS_BOUNDS = L.latLngBounds(MSS_SOUTH_WEST, MSS_NORTH_EAST)
 const WIND_SPEED_API = 'https://api-open.data.gov.sg/v2/real-time/api/wind-speed'
 const WIND_DIRECTION_API = 'https://api-open.data.gov.sg/v2/real-time/api/wind-direction'
 const RAINVIEWER_API = 'https://api.rainviewer.com/public/weather-maps.json'
+// OpenFreeMap's build of the Positron style — the same design as CARTO's
+// Positron raster tiles this app used before CARTO started requiring an API
+// key, but free and keyless. Vector, so it stays sharp at every zoom.
+const BASEMAP_STYLE = 'https://tiles.openfreemap.org/styles/positron'
+setWorkerUrl(maplibreWorkerUrl)
+// Rain cells are carried by the wind 1.5-3km up, not the surface wind the
+// weather stations measure (which is slowed and turned by friction, and
+// often points a different way entirely). Open-Meteo's 850/700 hPa model wind
+// over Singapore is the standard "steering flow" first guess for storm motion.
+const STEERING_API =
+  'https://api.open-meteo.com/v1/forecast?latitude=1.35&longitude=103.82' +
+  '&hourly=wind_speed_850hPa,wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa' +
+  '&past_hours=2&forecast_hours=4&timezone=UTC'
+// Same-origin path to MSS's radar images (see vite.config.ts), so their
+// pixels can be read for motion tracking.
+const MSS_PROXY_BASE = '/mss-radar'
 const KNOTS_TO_KMH = 1.852
 const KM_PER_DEG_LAT = 111
 // RainViewer's public composite only has native imagery up to this zoom for this
@@ -30,32 +61,15 @@ const RAINVIEWER_TILE_SIZE = 512
 // The opacity RainViewer's own client defaults to for the radar layer
 // (their bundle: opacity ?? 83, divided by 100). MSS keeps its own value.
 const RAINVIEWER_LAYER_OPACITY = 0.83
-// Their pre-coloured tile endpoint ignores this value entirely — schemes
-// 0/1/2/4/8/9 all return byte-identical PNGs, so only the `smooth_snow`
-// suffix actually changes anything here. (Their app passes 255 instead, which
-// returns raw dBZ-encoded tiles it colours itself in a MapLibre shader; that
-// path needs WebGL and isn't reproducible with plain Leaflet raster tiles.)
-// Kept as a named constant so the URL shape stays obvious, and set to the
-// smooth+snow combination their client defaults to.
+// Their public tiles now only serve the "Universal Blue" scheme whatever is
+// asked for here; kept as a named constant so the URL shape stays obvious.
 const RAINVIEWER_TILE_STYLE = '4/1_1'
-// A published nowcast frame is only trusted for offsets within this many
-// minutes of its own timestamp, so we don't stretch a 10-min-interval frame
-// too far. RainViewer's frames normally land on a 10-min grid, so any point
-// on the timeline is at most 5 min from the nearest one — this tolerance is
-// comfortably above that, so real published data always wins over our own
-// echo-motion/wind extrapolation whenever RainViewer has actually published
-// something for that lead time; a slightly irregular publish schedule is the
-// only thing the extra margin is guarding against.
-const RAINVIEWER_MATCH_TOLERANCE_MIN = 8
-// Crossfade duration for swapping radar/satellite frames — must match the CSS
-// `transition: opacity` duration on .radar-image so the JS removal timer doesn't
-// cut a layer before its fade-out finishes. Slightly longer than a hard cut so
-// consecutive 5-min frames read as one continuous, flowing motion.
+// Crossfade duration for swapping radar frames on the fallback image layers —
+// must match the CSS `transition: opacity` duration on .radar-image.
 const FADE_MS = 600
 
 // Slippy-map tile math (standard Web Mercator), used to stitch RainViewer's
-// tiled mosaic into one raster we can wind-shift the same way as MSS's single
-// composite image — RainViewer only ever gives us a tile grid, not one image.
+// tiled mosaic into one raster — RainViewer only ever gives us a tile grid.
 function lonToTileX(lon: number, z: number) {
   return Math.floor(((lon + 180) / 360) * 2 ** z)
 }
@@ -71,8 +85,8 @@ function tileYToLat(y: number, z: number) {
   return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)))
 }
 
-// Extra tiles of margin fetched around the SG/JB bounding box, so wind-shifting
-// a band never slides content far enough to reveal the stitched raster's edge.
+// Extra tiles of margin fetched around the SG/JB bounding box, so rain
+// approaching from well outside Singapore is already in the raster.
 const RAINVIEWER_TILE_PADDING = 1
 const RV_MIN_TILE_X = lonToTileX(MSS_SOUTH_WEST[1], RAINVIEWER_MAX_NATIVE_ZOOM) - RAINVIEWER_TILE_PADDING
 const RV_MAX_TILE_X = lonToTileX(MSS_NORTH_EAST[1], RAINVIEWER_MAX_NATIVE_ZOOM) + RAINVIEWER_TILE_PADDING
@@ -82,12 +96,9 @@ const RV_MAX_TILE_Y = latToTileY(MSS_SOUTH_WEST[0], RAINVIEWER_MAX_NATIVE_ZOOM) 
 // Full stitched raster size, known up front from the tile grid.
 const RV_STITCH_W = (RV_MAX_TILE_X - RV_MIN_TILE_X + 1) * RAINVIEWER_TILE_SIZE
 const RV_STITCH_H = (RV_MAX_TILE_Y - RV_MIN_TILE_Y + 1) * RAINVIEWER_TILE_SIZE
-// One z7 tile is ~313km, so padding a 60km-wide bounding box by a whole tile
-// on every side yields a ~1250x940km raster to display a ~300km view. Spending
-// the nowcast's pixel budget on that much off-screen area is what left the
-// future layer looking soft next to the crisp live tiles, so everything from
-// the analysis onward works on this centred square window instead. It still
-// comfortably covers the viewport with room to pan.
+// One z7 tile is ~313km, so the padded stitch is ~940km across. Everything
+// works on this centred square window (~470km) instead, which still covers
+// the viewport with room to pan and spends the pixel budget where it's seen.
 const RV_WINDOW = {
   size: Math.round(Math.min(RV_STITCH_W, RV_STITCH_H) * 0.5),
   get x() {
@@ -109,39 +120,41 @@ const RAINVIEWER_WINDOW_BOUNDS = L.latLngBounds(
   ],
 )
 
-// MSS's own color ramp for the rain-area product, light -> heavy.
-const INTENSITY_COLORS = [
-  '#40FFFD',
-  '#32D0D2',
-  '#1B8742',
-  '#38EF46',
-  '#FEFB63',
-  '#FDD74A',
-  '#FAA23D',
-  '#F94C2D',
-  '#DD1423',
-]
+// Legend ramps, taken from the exact palettes each source serves.
+const MSS_LEGEND = legendStops(MSS_PALETTE, 10)
+const RAINVIEWER_LEGEND = legendStops(RAINVIEWER_PALETTE, 10)
 
-// Approximation of the ramp RainViewer's pre-coloured tiles actually use,
-// light -> heavy, for the legend when the RainViewer source is selected. Their
-// tile colours don't come from a published stop list, so this is read off the
-// rendered tiles rather than an official spec — and note the scheme number in
-// the tile URL has no effect on what comes back (see RAINVIEWER_TILE_STYLE),
-// so there is only ever this one palette to match.
-const RAINVIEWER_INTENSITY_COLORS = [
-  '#5AD0F0',
-  '#3B9EE5',
-  '#3BB143',
-  '#8FD13B',
-  '#F2E23B',
-  '#F2A93B',
-  '#F2673B',
-  '#D63B3B',
-  '#9B2FAE',
-]
+// Motion-analysis tuning per source. MSS images are 217x120px over ~63x35km
+// (~0.3km/px) with a scan every 5 min; RainViewer's window is 768px over
+// ~470km (~0.6km/px) every 10 min. Analysis cells end up ~0.6km (MSS) and
+// ~2.4km (RainViewer), and search radii cover storm motion up to roughly
+// 40km/h either side of the steering-wind first guess.
+const MSS_FLOW_CONFIG: FlowSourceConfig = {
+  factor: 2,
+  flowCell: 8,
+  blockHalf: 8,
+  localRadius: 3,
+  baselineMin: 15,
+  searchRadius: 16,
+  pairRadius: 6,
+  // ~90 km² of this 63x35km image. Below that it's scattered specks, whose
+  // tracked "motion" was measured jumping around at random.
+  minCoverage: 0.04,
+}
+const RAINVIEWER_FLOW_CONFIG: FlowSourceConfig = {
+  factor: 4,
+  flowCell: 12,
+  blockHalf: 10,
+  localRadius: 3,
+  baselineMin: 30,
+  searchRadius: 12,
+  pairRadius: 4,
+  // ~1,100 km² of this ~470km window.
+  minCoverage: 0.005,
+}
 
-// A single frame from RainViewer's own radar/satellite mosaic, matched by
-// closest published timestamp to the requested epoch.
+// A single frame from RainViewer's own radar mosaic, matched by closest
+// published timestamp to the requested epoch.
 function closestRainviewerFrame(frames: RainviewerFrame[], targetEpoch: number): RainviewerFrame | null {
   let best: RainviewerFrame | null = null
   let bestDiff = Infinity
@@ -170,21 +183,17 @@ type WindVector = {
 // so band interpolation can just linearly blend them.
 type StationWind = { lat: number; lon: number; u: number; v: number }
 
-// The regional average (for the banner text) plus each station's own reading, so
-// the nowcast layer can drift different parts of Singapore at different real
-// wind speeds/directions instead of sliding the whole island as one rigid block.
+// The regional average plus each station's own reading.
 type WindField = { average: WindVector; stations: StationWind[] }
 
 type RainviewerFrame = { time: number; path: string }
 type RainviewerData = {
   host: string
   past: RainviewerFrame[]
-  nowcast: RainviewerFrame[]
 }
 
-// Which radar mosaic to render for past/live frames — MSS's own official
-// Singapore composite, or RainViewer's global stitched-radar mosaic (the same
-// source their web/app clients render).
+// Which radar mosaic to render — MSS's own official Singapore composite, or
+// RainViewer's global stitched-radar mosaic.
 type RadarSource = 'mss' | 'rainviewer'
 
 // Minimal single-color line icons (currentColor) replacing platform emoji —
@@ -308,10 +317,14 @@ function floorToSgFiveMin(epoch: number) {
   return flooredSg - 8 * 3600 * 1000
 }
 
-function mssImageUrl(epoch: number) {
+function mssImagePath(epoch: number) {
   const { y, mo, da, h, mi } = sgFields(epoch)
   const dt = `${y}${pad(mo)}${pad(da)}${pad(h)}${pad(mi)}`
-  return `https://www.weather.gov.sg/files/rainarea/50km/v2/dpsri_70km_${dt}0000dBR.dpsri.png`
+  return `/50km/v2/dpsri_70km_${dt}0000dBR.dpsri.png`
+}
+
+function mssImageUrl(epoch: number) {
+  return `https://www.weather.gov.sg/files/rainarea${mssImagePath(epoch)}`
 }
 
 function formatTime(epoch: number) {
@@ -321,6 +334,10 @@ function formatTime(epoch: number) {
     hour12: true,
     timeZone: 'Asia/Singapore',
   })
+}
+
+function compassPoint(bearingDeg: number) {
+  return ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(bearingDeg / 45) % 8]
 }
 
 // A short, sharp tap for each timeline tick crossed while dragging. iOS
@@ -342,6 +359,55 @@ function preloadImage(url: string): Promise<boolean> {
   })
 }
 
+function loadImage(url: string, crossOrigin = false): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    const img = new Image()
+    if (crossOrigin) img.crossOrigin = 'anonymous'
+    img.onload = () => resolve(img)
+    img.onerror = () => resolve(null)
+    img.src = url
+  })
+}
+
+// Keyframe keys for MSS are the scan's epoch.
+function loadMssFrame(key: string) {
+  return loadImage(`${MSS_PROXY_BASE}${mssImagePath(Number(key))}`)
+}
+
+// Fetches the small tile grid covering SG/JB for one RainViewer frame and
+// draws it into one raster, cropped to RV_WINDOW. RainViewer's tiles send
+// CORS headers, so the result can be read back pixel by pixel.
+async function stitchRainviewerFrame(host: string, path: string): Promise<HTMLCanvasElement | null> {
+  const cols = RV_MAX_TILE_X - RV_MIN_TILE_X + 1
+  const rows = RV_MAX_TILE_Y - RV_MIN_TILE_Y + 1
+  const stitch = document.createElement('canvas')
+  stitch.width = cols * RAINVIEWER_TILE_SIZE
+  stitch.height = rows * RAINVIEWER_TILE_SIZE
+  const ctx = stitch.getContext('2d')!
+  const loads: Promise<boolean>[] = []
+  for (let ty = RV_MIN_TILE_Y; ty <= RV_MAX_TILE_Y; ty++) {
+    for (let tx = RV_MIN_TILE_X; tx <= RV_MAX_TILE_X; tx++) {
+      const url = `${host}${path}/${RAINVIEWER_TILE_SIZE}/${RAINVIEWER_MAX_NATIVE_ZOOM}/${tx}/${ty}/${RAINVIEWER_TILE_STYLE}.png`
+      loads.push(
+        loadImage(url, true).then((img) => {
+          if (!img) return false
+          ctx.drawImage(img, (tx - RV_MIN_TILE_X) * RAINVIEWER_TILE_SIZE, (ty - RV_MIN_TILE_Y) * RAINVIEWER_TILE_SIZE)
+          return true
+        }),
+      )
+    }
+  }
+  const results = await Promise.all(loads)
+  if (!results.some(Boolean)) return null
+  const windowed = document.createElement('canvas')
+  windowed.width = RV_WINDOW.size
+  windowed.height = RV_WINDOW.size
+  windowed
+    .getContext('2d')!
+    .drawImage(stitch, RV_WINDOW.x, RV_WINDOW.y, RV_WINDOW.size, RV_WINDOW.size, 0, 0, RV_WINDOW.size, RV_WINDOW.size)
+  return windowed
+}
+
 // Finds the actual latest MSS frame that exists, instead of guessing a fixed
 // publish-latency buffer (which was either too tight — showing a blank frame
 // — or too loose — showing a "LIVE" frame that's really several minutes
@@ -356,9 +422,8 @@ async function probeLatestMssEpoch(maxStepsBack = 4): Promise<number | null> {
   return null
 }
 
-// Fetches every station's own wind vector (not just one regional average) so the
-// nowcast layer can drift different parts of the island at different real
-// speeds/bearings — genuine differential wind shear instead of one rigid slide.
+// Fetches every station's own wind vector (not just one regional average),
+// for the wind arrows and as a last-resort drift estimate.
 async function fetchWindField(): Promise<WindField | null> {
   try {
     const [speedRes, dirRes] = await Promise.all([fetch(WIND_SPEED_API), fetch(WIND_DIRECTION_API)])
@@ -406,9 +471,38 @@ async function fetchWindField(): Promise<WindField | null> {
   }
 }
 
-// Inverse-distance-weighted blend of nearby stations' wind vectors at one point,
-// so each band of the nowcast image drifts by the real wind actually measured
-// near it instead of one island-wide average.
+// Model steering wind over Singapore for the current hour: the vector mean of
+// the 850 and 700 hPa winds, as east/north km/h.
+async function fetchSteeringWind(): Promise<SteeringWind | null> {
+  try {
+    const res = await fetch(STEERING_API)
+    if (!res.ok) return null
+    const json = await res.json()
+    const h = json.hourly
+    const times: number[] = h.time.map((t: string) => Date.parse(`${t}Z`))
+    let best = 0
+    for (let i = 1; i < times.length; i++) {
+      if (Math.abs(times[i] - Date.now()) < Math.abs(times[best] - Date.now())) best = i
+    }
+    let u = 0
+    let v = 0
+    let n = 0
+    for (const level of ['850hPa', '700hPa']) {
+      const speed = h[`wind_speed_${level}`]?.[best]
+      const from = h[`wind_direction_${level}`]?.[best]
+      if (typeof speed !== 'number' || typeof from !== 'number') continue
+      const rad = (from * Math.PI) / 180
+      u += -speed * Math.sin(rad)
+      v += -speed * Math.cos(rad)
+      n++
+    }
+    return n > 0 ? { u: u / n, v: v / n } : null
+  } catch {
+    return null
+  }
+}
+
+// Inverse-distance-weighted blend of nearby stations' wind vectors at one point.
 function interpolateWindAt(stations: StationWind[], lat: number, lon: number): { u: number; v: number } {
   let sumWeight = 0
   let sumU = 0
@@ -431,20 +525,9 @@ function nowcastFade(minutes: number) {
   return Math.max(0.2, 1 - (minutes / FUTURE_MINUTES) * 0.75)
 }
 
-// Gentler equivalent for the advected path, whose per-cell growth/decay
-// already removes intensity where the field is genuinely weakening. Fading
-// the layer as hard as nowcastFade does on top of that decays everything
-// twice, which is what made long lead times look washed out rather than
-// forecast.
-function evolvedNowcastFade(minutes: number) {
-  return Math.max(0.55, 1 - (minutes / FUTURE_MINUTES) * 0.35)
-}
-
-// Georeferenced, single-image radar overlay for one point in time. Crossfades by
-// preloading the next frame fully before swapping — the outgoing frame fades OUT
-// at the same time the incoming one fades IN (both held on the map together for
-// FADE_MS), so consecutive 5-min frames blend into one continuous motion instead
-// of a hard cut.
+// Fallback only (used when the motion-tracked FlowRadarLayer can't run, e.g.
+// no WebGL2 or the MSS proxy isn't deployed). Georeferenced single-image
+// radar overlay that crossfades between 5-min scans.
 function RadarImageLayer({
   frame,
   opacity,
@@ -549,28 +632,20 @@ function RadarImageLayer({
   return null
 }
 
-// How many horizontal (latitude) bands the last live frame is sliced into for
-// the nowcast — each band drifts by the real wind measured nearest to it, so
-// the island shears non-rigidly instead of sliding as one flat block.
+// How many horizontal (latitude) bands the fallback nowcast slices the last
+// frame into, so station-based drift can shear the island non-rigidly.
 const NOWCAST_BANDS = 12
-// Bands are drawn overlapping by this many source pixels and the composite is
-// then blurred, so seams between bands blend into a continuous, fluid edge
-// instead of visible strip boundaries.
+// Bands are drawn overlapping by this many source pixels so seams between
+// them blend into a continuous edge.
 const NOWCAST_BAND_OVERLAP_PX = 14
 
-// A drift estimate to extrapolate a radar frame forward with — either a set of
-// per-station wind vectors to interpolate band-by-band (MSS, where real wind
-// observations are available but not frame-to-frame motion), or a single
-// already-resolved velocity applied uniformly (RainViewer, where we instead
-// measure actual echo motion between two frames — see estimateEchoMotion).
+// A drift estimate for the fallback nowcast — per-station surface winds to
+// interpolate band-by-band, or one velocity applied uniformly (the steering
+// wind, which is the better estimate whenever it's available).
 type DriftSource = { kind: 'stations'; stations: StationWind[] } | { kind: 'uniform'; u: number; v: number }
 
-// Shared band-shift compositor behind both wind-drift nowcast layers below:
-// slices `image` into latitude bands over `bounds` and draws each shifted by
-// the drift vector estimated for it, so different parts of the island can
-// drift at different speeds/bearings — genuine differential shear rather than
-// one rigid slide of the whole frame (uniform drift sources shift every band
-// identically, which collapses to a plain single-vector slide).
+// Slices `image` into latitude bands over `bounds` and draws each shifted by
+// the drift vector estimated for it.
 function renderWindDriftFrame(
   canvas: HTMLCanvasElement,
   image: CanvasImageSource,
@@ -602,7 +677,7 @@ function renderWindDriftFrame(
   const bandHeight = h / NOWCAST_BANDS
 
   for (let band = 0; band < NOWCAST_BANDS; band++) {
-    // Row 0 is the north edge of the image; bounds.getNorthWest() is north.
+    // Row 0 is the north edge of the image.
     const bandCenterLat = ne.lat - ((band + 0.5) / NOWCAST_BANDS) * degLat
     const { u, v } =
       drift.kind === 'stations' ? interpolateWindAt(drift.stations, bandCenterLat, (sw.lng + ne.lng) / 2) : drift
@@ -619,634 +694,18 @@ function renderWindDriftFrame(
   }
 }
 
-function uniformDriftFromStationAverage(windField: WindField): DriftSource {
-  const rad = (windField.average.towardBearingDeg * Math.PI) / 180
-  return {
-    kind: 'uniform',
-    u: windField.average.speedKmh * Math.sin(rad),
-    v: windField.average.speedKmh * Math.cos(rad),
-  }
-}
-
-// Resolution of the downsampled grid the echo-motion search runs on, and how
-// far (in that grid's pixels) it searches in each direction. Coarser than the
-// native tile resolution on purpose — keeps the O(size^2 * radius^2) search
-// fast — with a parabolic sub-pixel refinement afterward to claw back
-// precision the downsampling would otherwise lose.
-const MOTION_GRID_SIZE = 160
-// At ~2.9km per analysis cell over a 30-min baseline, this covers storm
-// motion up to roughly 70km/h — comfortably above anything tropical
-// convection does here, and the search cost grows with its square.
-const MOTION_SEARCH_RADIUS = 12
-// The raster handed to the analysis has already been cut down to RV_WINDOW,
-// so no further cropping is needed here — measuring across the untrimmed
-// ~1250km stitch would put ~13km in every grid cell, and ten minutes of storm
-// motion lands well inside a single cell and correlates to exactly zero. On
-// the windowed raster a cell is ~3km, where real motion is resolvable.
-const MOTION_CROP_FRACTION = 1
-// Target gap between the two frames compared. Consecutive frames are 10 min
-// apart, which is too short for slow-moving equatorial convection to shift
-// measurably; a wider baseline gives both the motion search and the
-// growth/decay ratio a far better signal-to-noise ratio.
-const MOTION_BASELINE_MIN = 30
-// The best integer shift must beat "no motion at all" by at least this
-// fraction of the zero-shift error before it's trusted — guards against
-// chasing noise when the frame is mostly empty (no coherent rain pattern) or
-// truly hasn't moved.
-const MOTION_CONFIDENCE_MARGIN = 0.02
-
-// Resolution of the dense motion (flow) field laid over the frame. A single
-// global vector makes the whole map slide like one rigid sheet, which is the
-// main reason a pure-translation nowcast reads as fake — real echo fields
-// shear, rotate and move at different speeds in different places. Each cell
-// here gets its own vector, refined locally around the global estimate.
-const FLOW_GRID_SIZE = 16
-// Half-width (in motion-grid pixels) of the correlation window each flow cell
-// matches on. Wider than the cell itself so neighbouring windows overlap,
-// which keeps the recovered field continuous instead of tiled.
-const FLOW_BLOCK_HALF = 8
-// How far each cell may disagree with the global vector, in motion-grid
-// pixels. Deliberately small — local motion is a correction to the dominant
-// storm motion, not an independent search, so noise can't send one cell
-// flying off in its own direction.
-const FLOW_LOCAL_RADIUS = 4
-// Below this mean intensity a flow cell has too little rain to match on, and
-// simply inherits the global vector.
-const FLOW_SIGNAL_FLOOR = 4
-// Smoothing passes over the recovered field. Regularisation: neighbouring
-// cells should mostly agree, and this removes the isolated bad matches that
-// would otherwise tear the image during advection.
-const FLOW_SMOOTH_PASSES = 2
-// Backward-trajectory integration steps. With a spatially varying field a
-// single jump is only first-order accurate; stepping the trajectory back in
-// pieces lets curvature and rotation actually develop over long lead times.
-const ADVECT_SUBSTEPS = 3
-// Longest edge of the advected output raster. Caps per-frame render cost so
-// scrubbing and playback stay responsive.
-const ADVECT_MAX_DIM = 1024
-
-// The square window (in source-raster pixels) that motion and growth are
-// measured on, so the analysis grid can be mapped back onto the full raster.
-type MotionCrop = { x: number; y: number; size: number }
-
-// Centred square crop of the raster used for analysis. Square on purpose: the
-// stitch is wider than it is tall, and squashing that into a square grid gives
-// x and y different km-per-cell scales, which skews every recovered vector.
-function motionCropFor(w: number, h: number): MotionCrop {
-  const size = Math.round(Math.min(w, h) * MOTION_CROP_FRACTION)
-  return { x: Math.round((w - size) / 2), y: Math.round((h - size) / 2), size }
-}
-
-// Downsamples the crop window of a canvas to a small grayscale intensity grid
-// for the motion search below. Transparent pixels (no rain) are zero.
-function toMotionGrid(source: CanvasImageSource, size: number, crop: MotionCrop): Float32Array | null {
-  const c = document.createElement('canvas')
-  c.width = size
-  c.height = size
-  const ctx = c.getContext('2d')
-  if (!ctx) return null
-  ctx.drawImage(source, crop.x, crop.y, crop.size, crop.size, 0, 0, size, size)
-  let data: Uint8ClampedArray
-  try {
-    data = ctx.getImageData(0, 0, size, size).data
-  } catch {
-    // Tainted canvas — shouldn't happen since RainViewer's tiles send CORS
-    // headers, but fail closed rather than throw if that ever changes.
-    return null
-  }
-  const out = new Float32Array(size * size)
-  for (let i = 0; i < size * size; i++) {
-    const a = data[i * 4 + 3]
-    out[i] = a < 10 ? 0 : (data[i * 4] + data[i * 4 + 1] + data[i * 4 + 2]) / 3
-  }
-  return out
-}
-
-// Finds the pixel translation that best aligns `prev` onto `curr` by
-// minimizing mean squared difference over their overlap — a plain,
-// dependency-free stand-in for optical flow. Good enough to pull out one
-// dominant storm-motion vector at this resolution, not a full flow field.
-function estimateGridShift(
-  prev: Float32Array,
-  curr: Float32Array,
-  size: number,
-  radius: number,
-): { dx: number; dy: number; confident: boolean } | null {
-  const span = radius * 2 + 1
-  const errGrid = new Float32Array(span * span).fill(Infinity)
-  let bestErr = Infinity
-  let bestI = radius
-  let bestJ = radius
-
-  for (let j = 0; j < span; j++) {
-    const dy = j - radius
-    for (let i = 0; i < span; i++) {
-      const dx = i - radius
-      let sum = 0
-      let count = 0
-      for (let y = 0; y < size; y++) {
-        const py = y - dy
-        if (py < 0 || py >= size) continue
-        const rowOff = y * size
-        const prowOff = py * size
-        for (let x = 0; x < size; x++) {
-          const px = x - dx
-          if (px < 0 || px >= size) continue
-          const diff = curr[rowOff + x] - prev[prowOff + px]
-          sum += diff * diff
-          count++
-        }
-      }
-      if (count < size * size * 0.5) continue
-      const err = sum / count
-      errGrid[j * span + i] = err
-      if (err < bestErr) {
-        bestErr = err
-        bestI = i
-        bestJ = j
-      }
-    }
-  }
-
-  const zeroErr = errGrid[radius * span + radius]
-  if (!Number.isFinite(bestErr) || !Number.isFinite(zeroErr) || zeroErr === 0) return null
-  // A weak margin means "this field isn't coherently translating", which for
-  // slow-moving equatorial convection is the correct answer, not a failure.
-  // Report it as near-zero motion and let growth/decay carry the evolution —
-  // returning null here would drop the caller onto the uniform wind-drift
-  // slide, which is a strictly worse model of what's happening.
-  const confident = (zeroErr - bestErr) / zeroErr >= MOTION_CONFIDENCE_MARGIN
-  if (!confident) return { dx: 0, dy: 0, confident: false }
-
-  // Parabolic sub-pixel refinement using the immediate neighbors of the best
-  // integer shift, independently in each axis.
-  let subI = bestI
-  let subJ = bestJ
-  if (bestI > 0 && bestI < span - 1) {
-    const eL = errGrid[bestJ * span + (bestI - 1)]
-    const eR = errGrid[bestJ * span + (bestI + 1)]
-    const denom = eL - 2 * bestErr + eR
-    if (Number.isFinite(eL) && Number.isFinite(eR) && denom !== 0) subI = bestI + (0.5 * (eL - eR)) / denom
-  }
-  if (bestJ > 0 && bestJ < span - 1) {
-    const eT = errGrid[(bestJ - 1) * span + bestI]
-    const eB = errGrid[(bestJ + 1) * span + bestI]
-    const denom = eT - 2 * bestErr + eB
-    if (Number.isFinite(eT) && Number.isFinite(eB) && denom !== 0) subJ = bestJ + (0.5 * (eT - eB)) / denom
-  }
-
-  return { dx: subI - radius, dy: subJ - radius, confident: true }
-}
-
-// A dense motion field over the frame, in motion-grid pixels per frame
-// interval. `u` is rightward (east), `v` is downward (south, i.e. increasing
-// row index) so it composes directly with image coordinates.
-type FlowField = { u: Float32Array; v: Float32Array; size: number }
-
-// Recovers a per-cell motion field by matching a window around each flow cell
-// between the two frames, searching only a small neighbourhood around the
-// already-known global vector. Cells without enough rain to match on inherit
-// the global vector, so empty sky never invents its own motion.
-function estimateFlowField(
-  prev: Float32Array,
-  curr: Float32Array,
-  size: number,
-  globalDx: number,
-  globalDy: number,
-): FlowField {
-  const n = FLOW_GRID_SIZE
-  const u = new Float32Array(n * n)
-  const v = new Float32Array(n * n)
-  const baseDx = Math.round(globalDx)
-  const baseDy = Math.round(globalDy)
-  const span = FLOW_LOCAL_RADIUS * 2 + 1
-  const errs = new Float32Array(span * span)
-
-  for (let fy = 0; fy < n; fy++) {
-    for (let fx = 0; fx < n; fx++) {
-      const cx = Math.round(((fx + 0.5) * size) / n)
-      const cy = Math.round(((fy + 0.5) * size) / n)
-      const x0 = Math.max(0, cx - FLOW_BLOCK_HALF)
-      const x1 = Math.min(size - 1, cx + FLOW_BLOCK_HALF)
-      const y0 = Math.max(0, cy - FLOW_BLOCK_HALF)
-      const y1 = Math.min(size - 1, cy + FLOW_BLOCK_HALF)
-
-      // Not enough signal in this window to match on — inherit global motion.
-      let signal = 0
-      let cells = 0
-      for (let y = y0; y <= y1; y++) {
-        for (let x = x0; x <= x1; x++) {
-          signal += curr[y * size + x]
-          cells++
-        }
-      }
-      const idx = fy * n + fx
-      if (cells === 0 || signal / cells < FLOW_SIGNAL_FLOOR) {
-        u[idx] = globalDx
-        v[idx] = globalDy
-        continue
-      }
-
-      errs.fill(Infinity)
-      let bestErr = Infinity
-      let bestI = FLOW_LOCAL_RADIUS
-      let bestJ = FLOW_LOCAL_RADIUS
-      for (let j = 0; j < span; j++) {
-        const dy = baseDy + (j - FLOW_LOCAL_RADIUS)
-        for (let i = 0; i < span; i++) {
-          const dx = baseDx + (i - FLOW_LOCAL_RADIUS)
-          let sum = 0
-          let count = 0
-          for (let y = y0; y <= y1; y++) {
-            const py = y - dy
-            if (py < 0 || py >= size) continue
-            for (let x = x0; x <= x1; x++) {
-              const px = x - dx
-              if (px < 0 || px >= size) continue
-              const diff = curr[y * size + x] - prev[py * size + px]
-              sum += diff * diff
-              count++
-            }
-          }
-          if (count < (x1 - x0 + 1) * (y1 - y0 + 1) * 0.5) continue
-          const err = sum / count
-          errs[j * span + i] = err
-          if (err < bestErr) {
-            bestErr = err
-            bestI = i
-            bestJ = j
-          }
-        }
-      }
-
-      if (!Number.isFinite(bestErr)) {
-        u[idx] = globalDx
-        v[idx] = globalDy
-        continue
-      }
-
-      // Same parabolic sub-pixel refinement as the global search, so the field
-      // varies smoothly rather than in whole-pixel steps.
-      let subI = bestI
-      let subJ = bestJ
-      if (bestI > 0 && bestI < span - 1) {
-        const eL = errs[bestJ * span + (bestI - 1)]
-        const eR = errs[bestJ * span + (bestI + 1)]
-        const denom = eL - 2 * bestErr + eR
-        if (Number.isFinite(eL) && Number.isFinite(eR) && denom !== 0) {
-          subI = bestI + (0.5 * (eL - eR)) / denom
-        }
-      }
-      if (bestJ > 0 && bestJ < span - 1) {
-        const eT = errs[(bestJ - 1) * span + bestI]
-        const eB = errs[(bestJ + 1) * span + bestI]
-        const denom = eT - 2 * bestErr + eB
-        if (Number.isFinite(eT) && Number.isFinite(eB) && denom !== 0) {
-          subJ = bestJ + (0.5 * (eT - eB)) / denom
-        }
-      }
-
-      u[idx] = baseDx + (subI - FLOW_LOCAL_RADIUS)
-      v[idx] = baseDy + (subJ - FLOW_LOCAL_RADIUS)
-    }
-  }
-
-  smoothFlowField(u, v, n, FLOW_SMOOTH_PASSES)
-  return { u, v, size: n }
-}
-
-// Box-smooths the flow field in place. Neighbouring cells describe the same
-// air mass and should largely agree; without this, one bad block match tears
-// a visible seam through the advected image.
-function smoothFlowField(u: Float32Array, v: Float32Array, n: number, passes: number) {
-  const tmpU = new Float32Array(u.length)
-  const tmpV = new Float32Array(v.length)
-  for (let p = 0; p < passes; p++) {
-    for (let y = 0; y < n; y++) {
-      for (let x = 0; x < n; x++) {
-        let su = 0
-        let sv = 0
-        let c = 0
-        for (let dy = -1; dy <= 1; dy++) {
-          const yy = y + dy
-          if (yy < 0 || yy >= n) continue
-          for (let dx = -1; dx <= 1; dx++) {
-            const xx = x + dx
-            if (xx < 0 || xx >= n) continue
-            su += u[yy * n + xx]
-            sv += v[yy * n + xx]
-            c++
-          }
-        }
-        tmpU[y * n + x] = su / c
-        tmpV[y * n + x] = sv / c
-      }
-    }
-    u.set(tmpU)
-    v.set(tmpV)
-  }
-}
-
-// Samples the flow field at fractional flow-grid coordinates, clamping at the
-// edges so trajectories leaving the domain still get a sensible vector.
-function sampleFlow(field: FlowField, fx: number, fy: number): { u: number; v: number } {
-  const n = field.size
-  const cx = Math.min(n - 1, Math.max(0, fx))
-  const cy = Math.min(n - 1, Math.max(0, fy))
-  const x0 = Math.floor(cx)
-  const y0 = Math.floor(cy)
-  const x1 = Math.min(x0 + 1, n - 1)
-  const y1 = Math.min(y0 + 1, n - 1)
-  const tx = cx - x0
-  const ty = cy - y0
-  const w00 = (1 - tx) * (1 - ty)
-  const w10 = tx * (1 - ty)
-  const w01 = (1 - tx) * ty
-  const w11 = tx * ty
-  const i00 = y0 * n + x0
-  const i10 = y0 * n + x1
-  const i01 = y1 * n + x0
-  const i11 = y1 * n + x1
-  return {
-    u: field.u[i00] * w00 + field.u[i10] * w10 + field.u[i01] * w01 + field.u[i11] * w11,
-    v: field.v[i00] * w00 + field.v[i10] * w10 + field.v[i01] * w01 + field.v[i11] * w11,
-  }
-}
-
-// Converts a pixel displacement measured between two frames spaced
-// `dtMinutes` apart into an eastward/northward km/h velocity, inverting the
-// same geometry renderWindDriftFrame uses to turn a velocity into a shift.
-function pixelShiftToVelocity(
-  dxPx: number,
-  dyPx: number,
-  bounds: L.LatLngBounds,
-  w: number,
-  h: number,
-  dtMinutes: number,
-): { u: number; v: number } {
-  const sw = bounds.getSouthWest()
-  const ne = bounds.getNorthEast()
-  const degLat = ne.lat - sw.lat
-  const degLon = ne.lng - sw.lng
-  const centerLat = (sw.lat + ne.lat) / 2
-  const pxPerDegLat = h / degLat
-  const pxPerDegLon = w / degLon
-  const hours = dtMinutes / 60
-  const u = (dxPx / pxPerDegLon) * KM_PER_DEG_LAT * Math.cos((centerLat * Math.PI) / 180) * (1 / hours)
-  const v = (-dyPx / pxPerDegLat) * KM_PER_DEG_LAT * (1 / hours)
-  return { u, v }
-}
-
-// Bilinear-samples a square grid at fractional coordinates; null outside it.
-function sampleGridBilinear(grid: Float32Array, size: number, x: number, y: number): number | null {
-  if (x < 0 || y < 0 || x > size - 1 || y > size - 1) return null
-  const x0 = Math.floor(x)
-  const y0 = Math.floor(y)
-  const x1 = Math.min(x0 + 1, size - 1)
-  const y1 = Math.min(y0 + 1, size - 1)
-  const fx = x - x0
-  const fy = y - y0
-  const v00 = grid[y0 * size + x0]
-  const v10 = grid[y0 * size + x1]
-  const v01 = grid[y1 * size + x0]
-  const v11 = grid[y1 * size + x1]
-  return v00 * (1 - fx) * (1 - fy) + v10 * fx * (1 - fy) + v01 * (1 - fx) * fy + v11 * fx * fy
-}
-
-// Below this grayscale intensity a cell is treated as "no rain" — guards the
-// growth-ratio measurement below against amplifying sensor/compression noise
-// in near-empty areas, where a tiny prevVal would otherwise blow the ratio up.
-const GROWTH_SIGNAL_FLOOR = 8
-// Per-interval growth ratio is clamped to this range before extrapolation —
-// a single frame-to-frame comparison is noisy, so this keeps one outlier
-// interval from producing an absurd forward extrapolation.
-// Asymmetric on purpose. Decay extrapolates reasonably — a weakening cell
-// usually keeps weakening — but growth does not: a faint echo that happened to
-// brighten over one interval will not keep quadrupling, and letting it try
-// blooms noise into big soft blobs that read as obviously fake. So growth is
-// held on a much shorter leash than decay.
-const GROWTH_RATIO_MIN = 0.3
-const GROWTH_RATIO_MAX = 1.8
-// Final extrapolated growth factor (ratio raised to the lead-time power) is
-// clamped to this range — real cells don't sustain exponential growth for
-// two hours, and this keeps far-future frames from blowing out or vanishing.
-const GROWTH_FACTOR_MIN = 0.15
-const GROWTH_FACTOR_MAX = 2
-// Caps how many "intervals" the growth ratio gets extrapolated across, so a
-// two-hour lead time (potentially 12+ ten-minute intervals) doesn't compound
-// a noisy per-interval ratio into an extreme value before the factor clamp
-// above even applies.
-const GROWTH_POWER_CAP = 6
-
-// A per-cell intensity growth/decay map, in the same low-res grid used for
-// motion estimation: growthGrid[i] is how much cell i's intensity multiplied
-// between the two source frames, after compensating for the frame's overall
-// motion (so a storm that simply moved isn't misread as decaying where it
-// used to be and growing where it now is).
-function buildGrowthGrid(
-  prevGrid: Float32Array,
-  currGrid: Float32Array,
-  size: number,
-  flow: FlowField,
-): Float32Array {
-  const out = new Float32Array(size * size)
-  const toFlow = flow.size / size
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const i = y * size + x
-      // Compensate with this cell's own vector, not a single global shift, so
-      // sheared or rotating parts of the field are compared against the right
-      // upstream source rather than being misread as growth or decay.
-      const { u: fu, v: fv } = sampleFlow(flow, x * toFlow, y * toFlow)
-      const prevVal = sampleGridBilinear(prevGrid, size, x - fu, y - fv)
-      const currVal = currGrid[i]
-      if (prevVal === null || (prevVal < GROWTH_SIGNAL_FLOOR && currVal < GROWTH_SIGNAL_FLOOR)) {
-        out[i] = 1
-        continue
-      }
-      const ratio = currVal / Math.max(prevVal, GROWTH_SIGNAL_FLOOR)
-      out[i] = Math.min(GROWTH_RATIO_MAX, Math.max(GROWTH_RATIO_MIN, ratio))
-    }
-  }
-  return out
-}
-
-type EchoEvolution = {
-  // Domain-average velocity, kept for the wind readout / debugging.
-  motion: { u: number; v: number }
-  // Per-cell motion, in motion-grid pixels per frame interval. This is what
-  // actually drives advection.
-  flow: FlowField
-  growthGrid: Float32Array
-  gridSize: number
-  dtMinutes: number
-  // Window of the source raster the grids above describe.
-  crop: MotionCrop
-}
-
-// Estimates how a RainViewer frame is actually evolving — both its overall
-// motion and, per region, whether it's intensifying or weakening — by
-// comparing it against the previous frame (both already stitched to the same
-// raster/bounds), rather than relying on surface wind observations. This is
-// closer to how RainViewer's own app keeps extrapolating past its published
-// nowcast window: real storms grow/decay in place at least as much as they
-// translate, which a pure position-shift can never represent.
-function estimateEchoEvolution(
-  prevCanvas: HTMLCanvasElement,
-  currCanvas: HTMLCanvasElement,
-  bounds: L.LatLngBounds,
-  dtMinutes: number,
-): EchoEvolution | null {
-  if (dtMinutes <= 0) return null
-  const crop = motionCropFor(currCanvas.width, currCanvas.height)
-  const prevGrid = toMotionGrid(prevCanvas, MOTION_GRID_SIZE, crop)
-  const currGrid = toMotionGrid(currCanvas, MOTION_GRID_SIZE, crop)
-  if (!prevGrid || !currGrid) return null
-  const shift = estimateGridShift(prevGrid, currGrid, MOTION_GRID_SIZE, MOTION_SEARCH_RADIUS)
-  // Only a genuinely degenerate frame (no data at all) gives up here. A
-  // low-confidence result still yields a valid evolution built around
-  // near-zero motion, which is the honest answer for a field that is
-  // growing and decaying in place rather than moving.
-  if (!shift) return null
-  // Crop pixels are square, so one scale covers both axes.
-  const scale = crop.size / MOTION_GRID_SIZE
-  const motion = pixelShiftToVelocity(
-    shift.dx * scale,
-    shift.dy * scale,
-    bounds,
-    currCanvas.width,
-    currCanvas.height,
-    dtMinutes,
-  )
-  // The global vector above is only the prior; the field below is what the
-  // frame actually did, cell by cell.
-  const flow = estimateFlowField(prevGrid, currGrid, MOTION_GRID_SIZE, shift.dx, shift.dy)
-  const growthGrid = buildGrowthGrid(prevGrid, currGrid, MOTION_GRID_SIZE, flow)
-  return { motion, flow, growthGrid, gridSize: MOTION_GRID_SIZE, dtMinutes, crop }
-}
-
-// Renders a future frame from measured echo motion AND per-region growth —
-// unlike renderWindDriftFrame (a pure position shift), this walks every
-// destination pixel back to its source position and scales that pixel's
-// alpha by how much its region was measured to be intensifying or weakening,
-// extrapolated to the requested lead time. Needs real pixel access (only
-// available for RainViewer's CORS-enabled tiles, not MSS's images).
-function renderEchoEvolutionFrame(
-  canvas: HTMLCanvasElement,
-  source: ImageData,
-  w: number,
-  h: number,
-  evolution: EchoEvolution,
-  offsetMinutes: number,
-) {
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
-
-  if (offsetMinutes <= 0) {
-    canvas.width = w
-    canvas.height = h
-    ctx.putImageData(source, 0, 0)
-    return
-  }
-
-  // Advection runs per output pixel, so the full 2048x1536 raster costs ~270ms
-  // a frame — far too slow to scrub or animate. The canvas's on-screen size is
-  // set separately by the layer's reposition handler, so shrinking the backing
-  // store just lowers the render resolution, and this layer is already given a
-  // slight blur for lead-time uncertainty, which hides the difference.
-  const renderScale = Math.max(1, Math.max(w, h) / ADVECT_MAX_DIM)
-  const outW = Math.max(1, Math.round(w / renderScale))
-  const outH = Math.max(1, Math.round(h / renderScale))
-  canvas.width = outW
-  canvas.height = outH
-
-  const { growthGrid, gridSize, flow, crop } = evolution
-  // How many frame intervals forward we're extrapolating. Both the trajectory
-  // length and the growth exponent scale with this.
-  const steps = offsetMinutes / evolution.dtMinutes
-  const growthPower = Math.min(GROWTH_POWER_CAP, steps)
-
-  // The grids describe the crop window, not the whole raster, so image pixels
-  // are mapped through it. Outside the window the samplers clamp to the edge,
-  // which extends the nearest measured behaviour rather than snapping to "no
-  // motion, no growth" and leaving a seam at the boundary.
-  const pxPerGrid = crop.size / gridSize
-  const toFlow = flow.size / crop.size
-
-  const substeps = Math.max(1, ADVECT_SUBSTEPS)
-  const stepFrac = steps / substeps
-
-  const src = source.data
-  const out = ctx.createImageData(outW, outH)
-  const dst = out.data
-
-  for (let oy = 0; oy < outH; oy++) {
-    const rowOff = oy * outW
-    for (let ox = 0; ox < outW; ox++) {
-      // Walk this destination pixel backwards along the flow to find where its
-      // rain came from. Integrating in substeps (rather than one jump) is what
-      // lets curved and rotating trajectories develop instead of every pixel
-      // travelling in a straight line. Trajectories are traced in full-raster
-      // coordinates even when the output is downscaled.
-      let sx = ox * renderScale
-      let sy = oy * renderScale
-      for (let s = 0; s < substeps; s++) {
-        const f = sampleFlow(flow, (sx - crop.x) * toFlow, (sy - crop.y) * toFlow)
-        sx -= f.u * pxPerGrid * stepFrac
-        sy -= f.v * pxPerGrid * stepFrac
-      }
-      if (sx < 0 || sy < 0 || sx > w - 1 || sy > h - 1) continue
-
-      // Growth measured at the upstream location, so a cell carries its own
-      // trend along with it rather than picking up wherever it lands.
-      const gx = Math.min(gridSize - 1, Math.max(0, (sx - crop.x) / pxPerGrid))
-      const gy = Math.min(gridSize - 1, Math.max(0, (sy - crop.y) / pxPerGrid))
-      const ratio = sampleGridBilinear(growthGrid, gridSize, gx, gy) ?? 1
-      const growth = Math.min(GROWTH_FACTOR_MAX, Math.max(GROWTH_FACTOR_MIN, Math.pow(ratio, growthPower)))
-
-      // Bilinear fetch of the source pixel — sub-pixel sampling is what turns
-      // the old pixel-snapping slide into continuous glide as you scrub.
-      const x0 = Math.floor(sx)
-      const y0 = Math.floor(sy)
-      const x1 = Math.min(x0 + 1, w - 1)
-      const y1 = Math.min(y0 + 1, h - 1)
-      const tx = sx - x0
-      const ty = sy - y0
-      const w00 = (1 - tx) * (1 - ty)
-      const w10 = tx * (1 - ty)
-      const w01 = (1 - tx) * ty
-      const w11 = tx * ty
-      const i00 = (y0 * w + x0) * 4
-      const i10 = (y0 * w + x1) * 4
-      const i01 = (y1 * w + x0) * 4
-      const i11 = (y1 * w + x1) * 4
-
-      const di = (rowOff + ox) * 4
-      dst[di] = src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11
-      dst[di + 1] = src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11
-      dst[di + 2] = src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11
-      const a = src[i00 + 3] * w00 + src[i10 + 3] * w10 + src[i01 + 3] * w01 + src[i11 + 3] * w11
-      dst[di + 3] = Math.min(255, a * growth)
-    }
-  }
-
-  ctx.putImageData(out, 0, 0)
-}
-
-// Extrapolates the latest observed MSS radar image forward using real
-// per-station wind data. This is a physical estimate (precipitation broadly
-// follows low-level wind over short horizons), not an official forecast —
-// it's faded and blurred out with lead time, and clearly labeled as such in
-// the UI.
+// Fallback only: extrapolates the latest MSS image forward by wind drift
+// when the motion-tracked layer can't run (MSS's images can't be read
+// pixel-by-pixel without the same-origin proxy).
 function LiquidNowcastLayer({
   baseFrame,
-  windField,
+  drift,
   offsetMinutes,
   opacity,
   visible,
 }: {
   baseFrame: RadarFrame | null
-  windField: WindField | null
+  drift: DriftSource | null
   offsetMinutes: number
   opacity: number
   visible: boolean
@@ -1284,9 +743,8 @@ function LiquidNowcastLayer({
     }
   }, [map])
 
-  // Load the base frame image once per URL (a plain <img>, never read back
-  // pixel-by-pixel — only drawImage'd — so this works fine despite MSS's
-  // radar images not sending CORS headers for our origin).
+  // Load the base frame image once per URL (a plain <img>, only ever
+  // drawImage'd — never read back — so MSS's CORS policy doesn't matter).
   useEffect(() => {
     if (!baseFrame) return
     if (loadedUrlRef.current === baseFrame.url && imgRef.current) return
@@ -1304,18 +762,15 @@ function LiquidNowcastLayer({
     }
   }, [baseFrame])
 
-  // Redraw the sheared composite whenever the lead time, wind field, or base
-  // image changes.
   useEffect(() => {
     const canvas = canvasRef.current
     const img = imgRef.current
     if (!canvas || !img || !img.naturalWidth) return
     if (!visible) return
-    const drift: DriftSource | null = windField ? { kind: 'stations', stations: windField.stations } : null
     renderWindDriftFrame(canvas, img, img.naturalWidth, img.naturalHeight, MSS_BOUNDS, drift, offsetMinutes)
     canvas.style.filter = `blur(${(offsetMinutes / FUTURE_MINUTES) * 3}px)`
     canvas.style.opacity = String(opacity * nowcastFade(offsetMinutes))
-  }, [imgReady, windField, offsetMinutes, opacity, visible])
+  }, [imgReady, drift, offsetMinutes, opacity, visible])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -1326,234 +781,8 @@ function LiquidNowcastLayer({
   return null
 }
 
-// Extrapolates RainViewer's latest global radar frame forward — RainViewer's
-// own published nowcast feed is intermittent (often empty for this region),
-// and without this the GLOBAL view would otherwise sit frozen on one frame
-// for the whole future range. Unlike LiquidNowcastLayer (MSS), this measures
-// real echo motion AND per-region growth/decay between the two latest
-// RainViewer frames (see estimateEchoEvolution) instead of relying on surface
-// wind observations — RainViewer's tiles, unlike MSS's images, send CORS
-// headers that let us read pixels back for that comparison, which is also
-// what lets cells intensify/weaken in place as they extrapolate forward
-// rather than just sliding as a frozen shape (a plain position-shift can
-// never do that — see conversation about RainViewer's own future radar
-// growing new cells instead of just sliding the old ones). Falls back to the
-// station wind average, with no growth/decay term, when that measurement
-// isn't available or isn't confident. RainViewer only serves a slippy tile
-// grid, so each frame's raster is stitched from a small grid of tiles around
-// SG/JB first rather than loaded as one image like MSS's composite.
-function RainviewerLiquidNowcastLayer({
-  host,
-  pastFrames,
-  windField,
-  offsetMinutes,
-  opacity,
-  visible,
-  colorScheme = RAINVIEWER_TILE_STYLE,
-}: {
-  host: string | null
-  pastFrames: RainviewerFrame[]
-  windField: WindField | null
-  offsetMinutes: number
-  opacity: number
-  visible: boolean
-  colorScheme?: string
-}) {
-  const map = useMap()
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const stitchRef = useRef<HTMLCanvasElement | null>(null)
-  const sourceDataRef = useRef<ImageData | null>(null)
-  const evolutionRef = useRef<EchoEvolution | null>(null)
-  const loadedKeyRef = useRef<string | null>(null)
-  const [stitchReady, setStitchReady] = useState(0)
-
-  const latest = pastFrames.length > 0 ? pastFrames[pastFrames.length - 1] : null
-  // Not simply the frame before `latest`: consecutive frames are 10 min apart,
-  // and over that gap slow-moving convection shifts by less than one analysis
-  // cell, so the correlation returns exactly zero every time. Comparing across
-  // ~MOTION_BASELINE_MIN gives motion and growth something measurable to work
-  // with. Falls back to the immediately-previous frame early in the feed.
-  const previous = useMemo(() => {
-    if (!latest || pastFrames.length < 2) return null
-    const targetTime = latest.time - MOTION_BASELINE_MIN * 60
-    let best: RainviewerFrame | null = null
-    let bestDiff = Infinity
-    for (const f of pastFrames) {
-      if (f.time >= latest.time) continue
-      const diff = Math.abs(f.time - targetTime)
-      if (diff < bestDiff) {
-        bestDiff = diff
-        best = f
-      }
-    }
-    return best
-  }, [pastFrames, latest])
-
-  useEffect(() => {
-    const canvas = L.DomUtil.create('canvas', 'radar-image') as HTMLCanvasElement
-    canvas.style.position = 'absolute'
-    canvas.style.pointerEvents = 'none'
-    map.getPanes().overlayPane!.appendChild(canvas)
-    canvasRef.current = canvas
-
-    const reposition = () => {
-      const topLeft = map.latLngToLayerPoint(RAINVIEWER_WINDOW_BOUNDS.getNorthWest())
-      const bottomRight = map.latLngToLayerPoint(RAINVIEWER_WINDOW_BOUNDS.getSouthEast())
-      const size = bottomRight.subtract(topLeft)
-      canvas.style.width = `${size.x}px`
-      canvas.style.height = `${size.y}px`
-      L.DomUtil.setPosition(canvas, topLeft)
-    }
-    reposition()
-    map.on('move zoom viewreset resize', reposition)
-
-    return () => {
-      map.off('move zoom viewreset resize', reposition)
-      canvas.remove()
-      canvasRef.current = null
-    }
-  }, [map])
-
-  // Fetch the small tile grid covering SG/JB and draw it into one offscreen
-  // raster, for both the latest frame (what's actually displayed) and the one
-  // before it (used only to measure motion, never displayed). RainViewer's
-  // tiles send CORS headers, so these are loaded with crossOrigin set,
-  // letting the motion search below read them back with getImageData.
-  useEffect(() => {
-    if (!host || !latest) return
-    const cacheKey = `${host}:${latest.path}:${previous?.path ?? ''}:${colorScheme}`
-    if (loadedKeyRef.current === cacheKey && stitchRef.current) return
-    let cancelled = false
-
-    async function stitchFrame(frame: RainviewerFrame): Promise<HTMLCanvasElement> {
-      const cols = RV_MAX_TILE_X - RV_MIN_TILE_X + 1
-      const rows = RV_MAX_TILE_Y - RV_MIN_TILE_Y + 1
-      const stitch = document.createElement('canvas')
-      stitch.width = cols * RAINVIEWER_TILE_SIZE
-      stitch.height = rows * RAINVIEWER_TILE_SIZE
-      const ctx = stitch.getContext('2d')!
-      const loads: Promise<void>[] = []
-      for (let ty = RV_MIN_TILE_Y; ty <= RV_MAX_TILE_Y; ty++) {
-        for (let tx = RV_MIN_TILE_X; tx <= RV_MAX_TILE_X; tx++) {
-          const url = `${host}${frame.path}/${RAINVIEWER_TILE_SIZE}/${RAINVIEWER_MAX_NATIVE_ZOOM}/${tx}/${ty}/${colorScheme}.png`
-          loads.push(
-            new Promise((resolve) => {
-              const img = new Image()
-              img.crossOrigin = 'anonymous'
-              img.onload = () => {
-                ctx.drawImage(
-                  img,
-                  (tx - RV_MIN_TILE_X) * RAINVIEWER_TILE_SIZE,
-                  (ty - RV_MIN_TILE_Y) * RAINVIEWER_TILE_SIZE,
-                )
-                resolve()
-              }
-              img.onerror = () => resolve()
-              img.src = url
-            }),
-          )
-        }
-      }
-      await Promise.all(loads)
-      // Hand back only the centred window. Everything downstream — motion,
-      // growth and the rendered frame itself — then works at ~2.7x the
-      // effective resolution over the area actually on screen, instead of
-      // spending most of its pixels on off-screen ocean.
-      const windowed = document.createElement('canvas')
-      windowed.width = RV_WINDOW.size
-      windowed.height = RV_WINDOW.size
-      windowed
-        .getContext('2d')!
-        .drawImage(
-          stitch,
-          RV_WINDOW.x,
-          RV_WINDOW.y,
-          RV_WINDOW.size,
-          RV_WINDOW.size,
-          0,
-          0,
-          RV_WINDOW.size,
-          RV_WINDOW.size,
-        )
-      return windowed
-    }
-
-    ;(async () => {
-      const latestStitch = await stitchFrame(latest)
-      if (cancelled) return
-
-      let evolution: EchoEvolution | null = null
-      if (previous) {
-        const previousStitch = await stitchFrame(previous)
-        if (cancelled) return
-        const dtMinutes = (latest.time - previous.time) / 60
-        evolution = estimateEchoEvolution(previousStitch, latestStitch, RAINVIEWER_WINDOW_BOUNDS, dtMinutes)
-      }
-
-      // Growth/decay extrapolation needs real pixel access to the displayed
-      // frame itself (not just the downsampled grids used to measure it).
-      let sourceData: ImageData | null = null
-      if (evolution) {
-        try {
-          sourceData = latestStitch.getContext('2d')!.getImageData(0, 0, latestStitch.width, latestStitch.height)
-        } catch {
-          evolution = null // fail closed to the plain shift-only fallback below
-        }
-      }
-
-      stitchRef.current = latestStitch
-      sourceDataRef.current = sourceData
-      evolutionRef.current = evolution
-      loadedKeyRef.current = cacheKey
-      setStitchReady((r) => r + 1)
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [host, latest, previous, colorScheme])
-
-  useEffect(() => {
-    const canvas = canvasRef.current
-    const stitch = stitchRef.current
-    if (!canvas || !stitch) return
-    if (!visible) return
-
-    const evolution = evolutionRef.current
-    const sourceData = sourceDataRef.current
-    if (evolution && sourceData) {
-      renderEchoEvolutionFrame(canvas, sourceData, stitch.width, stitch.height, evolution, offsetMinutes)
-    } else {
-      const drift: DriftSource | null = windField ? uniformDriftFromStationAverage(windField) : null
-      renderWindDriftFrame(canvas, stitch, stitch.width, stitch.height, RAINVIEWER_WINDOW_BOUNDS, drift, offsetMinutes)
-    }
-    if (evolution && sourceData) {
-      // The advected path models decay per cell, so it doesn't need the heavy
-      // global blur-and-dim the wind-drift path uses to signal uncertainty —
-      // stacking both on top of it just reads as "the picture is fading out"
-      // rather than as weather. A light touch still conveys lead-time
-      // uncertainty without flattening the structure.
-      canvas.style.filter = `blur(${(offsetMinutes / FUTURE_MINUTES) * 1.2}px)`
-      canvas.style.opacity = String(opacity * evolvedNowcastFade(offsetMinutes))
-    } else {
-      canvas.style.filter = `blur(${(offsetMinutes / FUTURE_MINUTES) * 3}px)`
-      canvas.style.opacity = String(opacity * nowcastFade(offsetMinutes))
-    }
-  }, [stitchReady, windField, offsetMinutes, opacity, visible])
-
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    if (!visible) canvas.style.opacity = '0'
-  }, [visible])
-
-  return null
-}
-
-// Real predicted radar tiles straight from RainViewer's own nowcast, when they've
-// published any (their free feed is intermittent — often empty). Same crossfade
-// pattern as RadarImageLayer, but tile-based since RainViewer serves a slippy grid.
-function RainviewerNowcastLayer({
+// Fallback only: RainViewer's radar tiles as a plain crossfading tile layer.
+function RainviewerTileLayer({
   host,
   frame,
   opacity,
@@ -1564,8 +793,6 @@ function RainviewerNowcastLayer({
   frame: RainviewerFrame | null
   opacity: number
   visible: boolean
-  // RainViewer's tile path segment for {color}/{smooth_snow}; radar defaults to
-  // its palette-4 smoothed scheme, satellite IR tiles want the raw '0/0_0'.
   colorScheme?: string
 }) {
   const map = useMap()
@@ -1620,10 +847,7 @@ function RainviewerNowcastLayer({
         zIndex: 18,
         // Stays 256 even though the URL asks for 512px images: RainViewer's
         // /512/ endpoint is a @2x render of the *same* z/x/y grid, not a
-        // coarser 512-tile scheme. Telling Leaflet 512 here would halve the
-        // effective zoom and slide the radar off the coastline; leaving it at
-        // 256 keeps the grid identical and just packs 4x the pixels into each
-        // cell, which is what makes it look sharp on a hi-DPI screen.
+        // coarser 512-tile scheme.
         tileSize: RAINVIEWER_GRID_SIZE,
         maxNativeZoom: RAINVIEWER_MAX_NATIVE_ZOOM,
         minNativeZoom: 2,
@@ -1647,8 +871,6 @@ function RainviewerNowcastLayer({
       layer!.setOpacity(visible ? opacity : 0)
       container?.classList.remove('radar-image-enter')
     }
-    // Same as RadarImageLayer: a layer just added at opacity 0 needs one
-    // committed frame before changing it, or the fade-in gets skipped.
     if (freshlyCreated) requestAnimationFrame(() => requestAnimationFrame(applyOpacity))
     else applyOpacity()
 
@@ -1788,9 +1010,8 @@ function MyLocationControl() {
 }
 
 // Small drifting wind-direction arrows scattered across the map, matching the
-// animated wind indicators in RainViewer's own app — built from the same
-// per-station wind field already fetched for the nowcast drift estimate, so
-// each arrow points where the air is actually moving at that spot right now.
+// animated wind indicators in RainViewer's own app — each arrow points where
+// the surface air is actually moving at that station right now.
 function WindArrowLayer({ stations, visible }: { stations: StationWind[]; visible: boolean }) {
   const map = useMap()
   const groupRef = useRef<L.LayerGroup | null>(null)
@@ -1835,6 +1056,22 @@ function WindArrowLayer({ stations, visible }: { stations: StationWind[]; visibl
   return null
 }
 
+// Positron rendered by MapLibre inside Leaflet's tile pane (so radar and
+// markers still stack above it). The canvas gets the .basemap-tile class,
+// whose invert + hue-rotate filter turns the light style into the app's dark
+// theme while keeping water blue and parks green.
+function VectorBasemap() {
+  const map = useMap()
+  useEffect(() => {
+    const layer = maplibreGL({ style: BASEMAP_STYLE, className: 'basemap-tile' } as Parameters<typeof maplibreGL>[0])
+    layer.addTo(map)
+    return () => {
+      layer.remove()
+    }
+  }, [map])
+  return null
+}
+
 function MapResizeHandler() {
   const map = useMap()
   useEffect(() => {
@@ -1861,14 +1098,27 @@ function MapResizeHandler() {
   return null
 }
 
+type Confidence = 'high' | 'medium' | 'low'
+
+// How far to trust an extrapolated frame. Radar extrapolation skill for
+// tropical convection falls off fast: roughly useful to ~30 min, indicative
+// to ~1h, and little better than a guess beyond. Anything not tracked from
+// the radar itself is downgraded a step, and the SG image only covers ~60km,
+// so rain arriving after ~45 min usually hasn't entered it yet.
+function forecastConfidence(leadMin: number, motion: MotionSource, smallDomain: boolean): Confidence {
+  let score = leadMin <= 30 ? 2 : leadMin <= 60 ? 1 : 0
+  if (motion !== 'radar') score--
+  if (smallDomain && leadMin > 45) score = Math.min(score, 0)
+  return score >= 2 ? 'high' : score === 1 ? 'medium' : 'low'
+}
+
 const PAST_MINUTES = 60
 const FUTURE_MINUTES = 120
 const STEP_MINUTES = 5
 // Fallback guess used only for the brief moment before the first real probe
 // (below) resolves — after that, "now" is whatever MSS frame actually loaded.
 const LIVE_SAFETY_BUFFER_MINUTES = 5
-// Playback speed for the continuous glide, tuned to roughly match the old
-// stepped pace (5 min every 700ms) so a full sweep of the timeline still
+// Playback speed for the continuous glide, so a full sweep of the timeline
 // takes about 25s.
 const PLAYBACK_MIN_PER_SEC = (PAST_MINUTES + FUTURE_MINUTES) / 25
 
@@ -1877,18 +1127,20 @@ export default function RadarMap() {
     floorToSgFiveMin(Date.now() - LIVE_SAFETY_BUFFER_MINUTES * 60 * 1000),
   )
   const [windField, setWindField] = useState<WindField | null>(null)
+  const [steering, setSteering] = useState<SteeringWind | null>(null)
   const [rainviewer, setRainviewer] = useState<RainviewerData | null>(null)
   const [offsetMinutes, setOffsetMinutes] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [playbackRate, setPlaybackRate] = useState(1)
   // Fixed rather than user-adjustable — one less control cluttering the screen.
-  // GLOBAL matches the value RainViewer's own client ships with so the layer
-  // sits over the basemap exactly as it does in their app; MSS keeps the
+  // GLOBAL matches the value RainViewer's own client ships with; MSS keeps the
   // slightly stronger value its thinner composite needs to stay readable.
   const [radarSource, setRadarSource] = useState<RadarSource>('mss')
   const opacity = radarSource === 'rainviewer' ? RAINVIEWER_LAYER_OPACITY : 0.92
   const [windVisible, setWindVisible] = useState(true)
   const [legendOpen, setLegendOpen] = useState(false)
+  const [mssFlow, setMssFlow] = useState<FlowStatus | null>(null)
+  const [rvFlow, setRvFlow] = useState<FlowStatus | null>(null)
   // Bumping this re-runs every live-data effect below immediately, for the
   // manual refresh button — on top of their normal polling intervals.
   const [refreshKey, setRefreshKey] = useState(0)
@@ -1901,10 +1153,8 @@ export default function RadarMap() {
   }, [])
 
   // Actually probes for the latest MSS frame that exists (instead of a fixed
-  // publish-latency guess), so "LIVE" reflects real data availability rather
-  // than an assumption that's sometimes too tight (blank frame) or too loose
-  // (stale frame). Re-probes on an interval and whenever the tab regains
-  // focus, so returning from background doesn't leave a stale frame showing.
+  // publish-latency guess). Re-probes on an interval and whenever the tab
+  // regains focus, so returning from background doesn't leave a stale frame.
   useEffect(() => {
     let cancelled = false
     async function sync() {
@@ -1942,19 +1192,27 @@ export default function RadarMap() {
   useEffect(() => {
     let cancelled = false
     async function load() {
+      const s = await fetchSteeringWind()
+      if (!cancelled && s) setSteering(s)
+    }
+    load()
+    const interval = window.setInterval(load, 30 * 60 * 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [refreshKey])
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
       try {
         const res = await fetch(RAINVIEWER_API)
         if (!res.ok) return
         const json = await res.json()
-        if (!cancelled) {
-          setRainviewer({
-            host: json.host,
-            past: json.radar?.past ?? [],
-            nowcast: json.radar?.nowcast ?? [],
-          })
-        }
+        if (!cancelled) setRainviewer({ host: json.host, past: json.radar?.past ?? [] })
       } catch {
-        // Silently skip — the wind-drift estimate remains available as a fallback.
+        // Silently skip — the SG source keeps working without it.
       }
     }
     load()
@@ -1977,68 +1235,115 @@ export default function RadarMap() {
     return frames
   }, [nowAnchor])
 
+  const mssKeyframes: FlowKeyframe[] = useMemo(
+    () => pastFrames.map((f) => ({ key: String(f.epoch), time: f.epoch })),
+    [pastFrames],
+  )
+
+  // RainViewer scans every 10 min; keep one scan older than the timeline's
+  // start so the earliest minutes still have a pair to interpolate within.
+  const rvKeyframes: FlowKeyframe[] = useMemo(() => {
+    if (!rainviewer) return []
+    const cutoff = nowAnchor - (PAST_MINUTES + 10) * 60 * 1000
+    return rainviewer.past
+      .filter((f) => f.time * 1000 >= cutoff)
+      .map((f) => ({ key: f.path, time: f.time * 1000 }))
+  }, [rainviewer, nowAnchor])
+
+  const rvHost = rainviewer?.host ?? null
+  const loadRainviewerFrame = useCallback(
+    (path: string) => (rvHost ? stitchRainviewerFrame(rvHost, path) : Promise.resolve(null)),
+    [rvHost],
+  )
+
   const isFuture = offsetMinutes > 0
   // Whole-minute snap of the continuously-gliding offset, used anywhere the
   // raw float would render an ugly fraction (badge text, the LIVE check).
   const roundedOffset = Math.round(offsetMinutes)
+  const displayEpoch = nowAnchor + offsetMinutes * 60 * 1000
 
   const currentFrame: RadarFrame | null = useMemo(() => {
     if (pastFrames.length === 0) return null
-    const targetEpoch = nowAnchor + offsetMinutes * 60 * 1000
     let closest = pastFrames[0]
     let bestDiff = Infinity
     for (const f of pastFrames) {
-      const diff = Math.abs(f.epoch - targetEpoch)
+      const diff = Math.abs(f.epoch - displayEpoch)
       if (diff < bestDiff) {
         bestDiff = diff
         closest = f
       }
     }
     return closest
-  }, [pastFrames, nowAnchor, offsetMinutes])
+  }, [pastFrames, displayEpoch])
 
   const liveFrame = pastFrames.length > 0 ? pastFrames[pastFrames.length - 1] : null
 
-  const displayTargetEpoch = nowAnchor + offsetMinutes * 60 * 1000
+  const fallbackRainviewerFrame: RainviewerFrame | null = useMemo(() => {
+    if (!rainviewer || rainviewer.past.length === 0) return null
+    return closestRainviewerFrame(rainviewer.past, displayEpoch)
+  }, [rainviewer, displayEpoch])
 
-  const matchingRainviewerFrame: RainviewerFrame | null = useMemo(() => {
-    if (!isFuture || !rainviewer || rainviewer.nowcast.length === 0) return null
-    const best = closestRainviewerFrame(rainviewer.nowcast, displayTargetEpoch)
-    if (!best) return null
-    return Math.abs(best.time * 1000 - displayTargetEpoch) <= RAINVIEWER_MATCH_TOLERANCE_MIN * 60 * 1000
-      ? best
-      : null
-  }, [isFuture, rainviewer, displayTargetEpoch])
+  const mssFlowReady = !!mssFlow?.ready
+  const rvFlowReady = !!rvFlow?.ready
 
-  const usingRealNowcast = isFuture && radarSource === 'rainviewer' && matchingRainviewerFrame !== null
+  // Fallback MSS drift: the steering wind if we have it (a far better proxy
+  // for storm motion than surface wind), otherwise per-station surface wind.
+  const fallbackDrift = useMemo<DriftSource | null>(() => {
+    if (steering) return { kind: 'uniform', u: steering.u, v: steering.v }
+    if (windField) return { kind: 'stations', stations: windField.stations }
+    return null
+  }, [steering, windField])
 
-  // RainViewer's own past-radar mosaic (same source their web/app clients
-  // render), used instead of MSS's composite when radarSource is 'rainviewer'.
-  const matchingRainviewerPastFrame: RainviewerFrame | null = useMemo(() => {
-    if (isFuture || !rainviewer || rainviewer.past.length === 0) return null
-    return closestRainviewerFrame(rainviewer.past, displayTargetEpoch)
-  }, [isFuture, rainviewer, displayTargetEpoch])
-
-  // When GLOBAL is selected but RainViewer hasn't published a real nowcast
-  // frame for this lead time, echo-drift their latest live frame (via
-  // RainviewerLiquidNowcastLayer below) instead of ever falling back to the
-  // MSS-based extrapolation — keeps the two radar sources from ever showing
-  // at once, and keeps the future view moving instead of sitting frozen.
-
-  const displayEpoch = displayTargetEpoch
-
-  // Whether the currently visible radar imagery is actually rendered from
-  // RainViewer's own tiles (their palette), as opposed to MSS's composite or
-  // our wind-drifted extrapolation of it (MSS's palette) — this now tracks the
-  // selected source directly rather than what happened to be available.
-  const usingRainviewerPalette = radarSource === 'rainviewer'
+  // What the info line under the time says: where this frame comes from, and
+  // for anything extrapolated, how the motion was measured and how far to
+  // trust it.
+  const note = useMemo(() => {
+    const flow = radarSource === 'mss' ? mssFlow : rvFlow
+    const flowReady = !!flow?.ready
+    const latestScan = flowReady
+      ? flow!.latestScan!
+      : radarSource === 'mss'
+        ? nowAnchor
+        : (rainviewer?.past.at(-1)?.time ?? 0) * 1000
+    const leadMin = latestScan ? (displayEpoch - latestScan) / 60_000 : 0
+    const sourceName = radarSource === 'mss' ? 'MSS radar' : 'RainViewer radar'
+    if (leadMin <= 1) {
+      return {
+        text: `${sourceName} · observed${flowReady && offsetMinutes < 0 ? ', smoothed between scans' : ''}`,
+        confidence: null as Confidence | null,
+      }
+    }
+    let motion: MotionSource
+    let speed = 0
+    let bearing = 0
+    if (flowReady) {
+      motion = flow!.motionSource
+      speed = flow!.speedKmh
+      bearing = flow!.towardBearingDeg
+    } else if (steering) {
+      motion = 'steering'
+      speed = Math.hypot(steering.u, steering.v)
+      bearing = ((Math.atan2(steering.u, steering.v) * 180) / Math.PI + 360) % 360
+    } else {
+      motion = 'none'
+    }
+    const movement =
+      motion === 'none'
+        ? 'no motion estimate'
+        : speed < 3
+          ? 'rain near-stationary'
+          : `moving ${compassPoint(bearing)} ${Math.round(speed)} km/h`
+    const how = motion === 'radar' ? 'radar-tracked' : motion === 'steering' ? 'from upper wind' : ''
+    const prefix = offsetMinutes <= 0 ? `Last scan ${formatTime(latestScan)} · ` : 'Forecast · '
+    return {
+      text: `${prefix}${movement}${how ? ` (${how})` : ''}`,
+      confidence: forecastConfidence(leadMin, motion, radarSource === 'mss'),
+    }
+  }, [radarSource, mssFlow, rvFlow, nowAnchor, rainviewer, displayEpoch, offsetMinutes, steering])
 
   // Glides offsetMinutes continuously via rAF rather than jumping in fixed
-  // 5-min steps, so playback reads as one smooth sweep across the timeline —
-  // the thumb and displayed time drift steadily instead of snapping frame to
-  // frame. The underlying radar frame still only actually swaps (and
-  // crossfades) when the continuous offset crosses into the next 5-min
-  // bucket, via the existing nearest-frame match in `currentFrame`.
+  // 5-min steps; the flow layer synthesises the radar for every in-between
+  // instant, so the rain itself moves continuously too.
   useEffect(() => {
     if (!playing) return
     let raf: number
@@ -2072,49 +1377,52 @@ export default function RadarMap() {
           zoomControl={false}
           attributionControl={false}
         >
-          <TileLayer
-            // Positron ("light_all") is CARTO's light basemap: subtle blue
-            // water and green parks with plain neutral-gray roads (unlike
-            // Voyager, which paints highways orange/yellow) — closest match
-            // to a clean Apple/Google Maps look once inverted to dark. The
-            // invert+hue-rotate(180) combo in .basemap-tile below flips it into
-            // a dark theme while keeping each feature's original hue intact.
-            url="https://{s}.basemaps.cartocdn.com/rastertiles/light_all/{z}/{x}/{y}{r}.png"
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-            subdomains="abcd"
-            className="basemap-tile"
+          <VectorBasemap />
+          <FlowRadarLayer
+            enabled={radarSource === 'mss'}
+            frames={mssKeyframes}
+            loadFrame={loadMssFrame}
+            bounds={MSS_BOUNDS}
+            palette={MSS_PALETTE}
+            config={MSS_FLOW_CONFIG}
+            targetTime={displayEpoch}
+            steering={steering}
+            opacity={opacity}
+            visible={radarSource === 'mss'}
+            onStatus={setMssFlow}
           />
+          <FlowRadarLayer
+            enabled={radarSource === 'rainviewer'}
+            frames={rvKeyframes}
+            loadFrame={loadRainviewerFrame}
+            bounds={RAINVIEWER_WINDOW_BOUNDS}
+            palette={RAINVIEWER_PALETTE}
+            config={RAINVIEWER_FLOW_CONFIG}
+            targetTime={displayEpoch}
+            steering={steering}
+            opacity={opacity}
+            visible={radarSource === 'rainviewer'}
+            onStatus={setRvFlow}
+          />
+          {/* Fallbacks, only shown while (or if) the motion-tracked layer
+              above can't render for the selected source. */}
           <RadarImageLayer
             frame={currentFrame}
             opacity={opacity}
-            visible={!isFuture && radarSource === 'mss'}
-          />
-          <RainviewerNowcastLayer
-            host={rainviewer?.host ?? null}
-            frame={matchingRainviewerPastFrame}
-            opacity={opacity}
-            visible={!isFuture && radarSource === 'rainviewer'}
-          />
-          <RainviewerNowcastLayer
-            host={rainviewer?.host ?? null}
-            frame={matchingRainviewerFrame}
-            opacity={opacity}
-            visible={usingRealNowcast}
-          />
-          <RainviewerLiquidNowcastLayer
-            host={rainviewer?.host ?? null}
-            pastFrames={rainviewer?.past ?? []}
-            windField={windField}
-            offsetMinutes={offsetMinutes}
-            opacity={opacity}
-            visible={isFuture && radarSource === 'rainviewer' && !usingRealNowcast}
+            visible={!isFuture && radarSource === 'mss' && !mssFlowReady}
           />
           <LiquidNowcastLayer
             baseFrame={liveFrame}
-            windField={windField}
+            drift={fallbackDrift}
             offsetMinutes={offsetMinutes}
             opacity={opacity}
-            visible={isFuture && radarSource === 'mss'}
+            visible={isFuture && radarSource === 'mss' && !mssFlowReady}
+          />
+          <RainviewerTileLayer
+            host={rvHost}
+            frame={fallbackRainviewerFrame}
+            opacity={opacity}
+            visible={radarSource === 'rainviewer' && !rvFlowReady}
           />
           <WindArrowLayer stations={windField?.stations ?? []} visible={windVisible} />
           <MapResizeHandler />
@@ -2131,16 +1439,24 @@ export default function RadarMap() {
           </div>
         </MapContainer>
 
-        {/* Required credit for the free CARTO/OpenStreetMap basemap tier — kept
-            small and out of the way of the floating controls above it, in the
-            thin strip beneath them rather than Leaflet's default clunky box. */}
+        {/* Required credit for the basemap and data sources — kept small and
+            out of the way of the floating controls above it, in the thin
+            strip beneath them rather than Leaflet's default clunky box. */}
         <div className="map-attribution">
+          <a href="https://openfreemap.org/" target="_blank" rel="noopener noreferrer">
+            OpenFreeMap
+          </a>
+          {' · '}
+          <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener noreferrer">
+            OpenMapTiles
+          </a>
+          {' · '}
           <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">
             OpenStreetMap
           </a>
           {' · '}
-          <a href="https://carto.com/attributions" target="_blank" rel="noopener noreferrer">
-            CARTO
+          <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer">
+            Open-Meteo
           </a>
         </div>
 
@@ -2176,7 +1492,7 @@ export default function RadarMap() {
             <div
               className="legend-gradient"
               style={{
-                background: `linear-gradient(to top, ${(usingRainviewerPalette ? RAINVIEWER_INTENSITY_COLORS : INTENSITY_COLORS).join(',')})`,
+                background: `linear-gradient(to top, ${(radarSource === 'rainviewer' ? RAINVIEWER_LEGEND : MSS_LEGEND).join(',')})`,
               }}
             />
             <div className="legend-ticks">
@@ -2222,6 +1538,13 @@ export default function RadarMap() {
             <span className="range-edge">+{Math.round(FUTURE_MINUTES / 60)}h</span>
           </div>
 
+          <div className="radar-note">
+            <span className="radar-note-text">{note.text}</span>
+            {note.confidence && (
+              <span className={`radar-note-confidence ${note.confidence}`}>{note.confidence} confidence</span>
+            )}
+          </div>
+
           <div className="controls-row">
             <button className="play-btn" onClick={togglePlay} aria-label={playing ? 'Pause' : 'Play'}>
               {playing ? <IconPause size={16} /> : <IconPlay size={16} />}
@@ -2241,14 +1564,16 @@ export default function RadarMap() {
                 className="timeline"
                 min={-PAST_MINUTES}
                 max={FUTURE_MINUTES}
-                step={STEP_MINUTES}
+                // 1-minute resolution: the layer renders any instant, so
+                // scrubbing glides instead of snapping between 5-min scans.
+                step={1}
                 value={offsetMinutes}
                 onChange={(e) => {
                   const next = Number(e.target.value)
-                  // Fires once per 5-min tick crossed (native range stepping
-                  // only emits change at step boundaries), so this taps a
-                  // vibration once per dot the thumb passes while dragging.
-                  if (next !== offsetMinutes) triggerTickHaptic()
+                  // Still one haptic tap per 5-min dot the thumb passes.
+                  if (Math.floor(next / STEP_MINUTES) !== Math.floor(offsetMinutes / STEP_MINUTES)) {
+                    triggerTickHaptic()
+                  }
                   setPlaying(false)
                   setOffsetMinutes(next)
                 }}
