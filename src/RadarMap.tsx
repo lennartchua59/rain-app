@@ -1058,31 +1058,57 @@ function WindArrowLayer({ stations, visible }: { stations: StationWind[]; visibl
   return null
 }
 
-type AirMetric = 'psi' | 'pm25'
+type AirMetric = 'psi' | 'psi1h' | 'pm25'
 type AirReading = { region: string; lat: number; lon: number; value: number }
 const NO_READINGS: AirReading[] = []
 
 // NEA's published bands. PSI is the 24-hour index, PM2.5 is the 1-hour
 // concentration in µg/m³ (the one NEA uses for its hourly health advisory).
-const AIR_BANDS: Record<AirMetric, { max: number; color: string }[]> = {
+// NEA doesn't publish an hourly PSI, so "1hr PSI" is estimated by running the
+// latest 1-hour PM2.5 through NEA's PM2.5 sub-index breakpoints (µg/m³ -> index).
+const PM25_TO_PSI: [number, number][] = [
+  [0, 0],
+  [12, 50],
+  [55, 100],
+  [150, 200],
+  [250, 300],
+  [350, 400],
+  [500, 500],
+]
+
+function pm25ToPsi(pm: number) {
+  for (let i = 1; i < PM25_TO_PSI.length; i++) {
+    const [c1, i1] = PM25_TO_PSI[i]
+    if (pm <= c1) {
+      const [c0, i0] = PM25_TO_PSI[i - 1]
+      return i0 + ((pm - c0) / (c1 - c0)) * (i1 - i0)
+    }
+  }
+  return 500
+}
+
+const AIR_BANDS: Record<AirMetric, { max: number; color: string; tag: string }[]> = {
   psi: [
-    { max: 50, color: '#3ddc84' },
-    { max: 100, color: '#45a8ff' },
-    { max: 200, color: '#ffb454' },
-    { max: 300, color: '#ff4d5e' },
-    { max: Infinity, color: '#b04bd6' },
+    { max: 50, color: '#3ddc84', tag: '1' },
+    { max: 100, color: '#45a8ff', tag: '2' },
+    { max: 200, color: '#ffb454', tag: '3' },
+    { max: 300, color: '#ff4d5e', tag: '4' },
+    { max: Infinity, color: '#b04bd6', tag: '5' },
   ],
+  get psi1h() {
+    return this.psi
+  },
   pm25: [
-    { max: 55, color: '#3ddc84' },
-    { max: 150, color: '#45a8ff' },
-    { max: 250, color: '#ffb454' },
-    { max: 350, color: '#ff4d5e' },
-    { max: Infinity, color: '#b04bd6' },
+    { max: 55, color: '#3ddc84', tag: '1' },
+    { max: 150, color: '#45a8ff', tag: '2' },
+    { max: 250, color: '#ffb454', tag: '3' },
+    { max: 350, color: '#ff4d5e', tag: '4' },
+    { max: Infinity, color: '#b04bd6', tag: '5' },
   ],
 }
 
-function airColor(metric: AirMetric, value: number) {
-  return (AIR_BANDS[metric].find((b) => value <= b.max) ?? AIR_BANDS[metric][0]).color
+function airBand(metric: AirMetric, value: number) {
+  return AIR_BANDS[metric].find((b) => value <= b.max) ?? AIR_BANDS[metric][0]
 }
 
 async function fetchAirReadings(metric: AirMetric): Promise<AirReading[]> {
@@ -1096,8 +1122,9 @@ async function fetchAirReadings(metric: AirMetric): Promise<AirReading[]> {
   if (!readings) return []
   const out: AirReading[] = []
   for (const r of regions) {
-    const value = readings[r.name]
-    if (typeof value !== 'number' || r.name === 'national') continue
+    const raw = readings[r.name]
+    if (typeof raw !== 'number' || r.name === 'national') continue
+    const value = metric === 'psi1h' ? pm25ToPsi(raw) : raw
     out.push({ region: r.name, lat: r.labelLocation.latitude, lon: r.labelLocation.longitude, value })
   }
   return out
@@ -1131,11 +1158,12 @@ function AirQualityLayer({ metric, refreshKey }: { metric: AirMetric | null; ref
     if (!metric) return
     const group = L.layerGroup().addTo(map)
     for (const r of readings) {
+      const band = airBand(metric, r.value)
       const icon = L.divIcon({
         className: 'air-badge-icon',
-        html: `<div class="air-badge" style="--air:${airColor(metric, r.value)}">${Math.round(r.value)}</div>`,
-        iconSize: [44, 26],
-        iconAnchor: [22, 13],
+        html: `<div class="air-badge" style="--air:${band.color}">${Math.round(r.value)}<span class="air-band">${band.tag}</span></div>`,
+        iconSize: [62, 26],
+        iconAnchor: [31, 13],
       })
       L.marker([r.lat, r.lon], { icon, interactive: false, keyboard: false }).addTo(group)
     }
@@ -1528,6 +1556,15 @@ export default function RadarMap() {
               aria-pressed={windVisible}
             >
               <IconWind />
+            </button>
+            <button
+              className={`tool-btn tool-btn-text${airMetric === 'psi1h' ? ' active' : ''}`}
+              onClick={() => setAirMetric((m) => (m === 'psi1h' ? null : 'psi1h'))}
+              aria-label="Toggle estimated 1-hour PSI"
+              aria-pressed={airMetric === 'psi1h'}
+            >
+              <span>1hr</span>
+              <span>PSI</span>
             </button>
             <button
               className={`tool-btn tool-btn-text${airMetric === 'psi' ? ' active' : ''}`}

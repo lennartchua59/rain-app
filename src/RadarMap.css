@@ -232,7 +232,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 44px;
+  gap: 5px;
+  width: 62px;
   height: 26px;
   border-radius: 999px;
   background: var(--air);
@@ -876,4 +877,14 @@
   .refresh-btn.spinning svg {
     animation: none !important;
   }
+}
+
+.air-band {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 800;
+  background: rgba(5, 20, 28, 0.78);
+  color: var(--air);
+  border-radius: 999px;
+  padding: 1px 5px;
 }
