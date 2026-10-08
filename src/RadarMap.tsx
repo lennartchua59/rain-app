@@ -1087,28 +1087,28 @@ function pm25ToPsi(pm: number) {
   return 500
 }
 
-const AIR_BANDS: Record<AirMetric, { max: number; color: string }[]> = {
+const AIR_BANDS: Record<AirMetric, { max: number; color: string; tag: string }[]> = {
   psi: [
-    { max: 50, color: '#3ddc84' },
-    { max: 100, color: '#45a8ff' },
-    { max: 200, color: '#ffb454' },
-    { max: 300, color: '#ff4d5e' },
-    { max: Infinity, color: '#b04bd6' },
+    { max: 50, color: '#3ddc84', tag: '1' },
+    { max: 100, color: '#45a8ff', tag: '2' },
+    { max: 200, color: '#ffb454', tag: '3' },
+    { max: 300, color: '#ff4d5e', tag: '4' },
+    { max: Infinity, color: '#b04bd6', tag: '5' },
   ],
   get psi1h() {
     return this.psi
   },
   pm25: [
-    { max: 55, color: '#3ddc84' },
-    { max: 150, color: '#45a8ff' },
-    { max: 250, color: '#ffb454' },
-    { max: 350, color: '#ff4d5e' },
-    { max: Infinity, color: '#b04bd6' },
+    { max: 55, color: '#3ddc84', tag: '1' },
+    { max: 150, color: '#45a8ff', tag: '2' },
+    { max: 250, color: '#ffb454', tag: '3' },
+    { max: 350, color: '#ff4d5e', tag: '4' },
+    { max: Infinity, color: '#b04bd6', tag: '5' },
   ],
 }
 
-function airColor(metric: AirMetric, value: number) {
-  return (AIR_BANDS[metric].find((b) => value <= b.max) ?? AIR_BANDS[metric][0]).color
+function airBand(metric: AirMetric, value: number) {
+  return AIR_BANDS[metric].find((b) => value <= b.max) ?? AIR_BANDS[metric][0]
 }
 
 async function fetchAirReadings(metric: AirMetric): Promise<AirReading[]> {
@@ -1158,11 +1158,12 @@ function AirQualityLayer({ metric, refreshKey }: { metric: AirMetric | null; ref
     if (!metric) return
     const group = L.layerGroup().addTo(map)
     for (const r of readings) {
+      const band = airBand(metric, r.value)
       const icon = L.divIcon({
         className: 'air-badge-icon',
-        html: `<div class="air-badge" style="--air:${airColor(metric, r.value)}">${Math.round(r.value)}</div>`,
-        iconSize: [44, 26],
-        iconAnchor: [22, 13],
+        html: `<div class="air-badge" style="--air:${band.color}">${Math.round(r.value)}<span class="air-band">${band.tag}</span></div>`,
+        iconSize: [62, 26],
+        iconAnchor: [31, 13],
       })
       L.marker([r.lat, r.lon], { icon, interactive: false, keyboard: false }).addTo(group)
     }
