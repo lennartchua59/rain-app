@@ -214,6 +214,35 @@
   cursor: pointer;
 }
 
+.tool-btn-text {
+  flex-direction: column;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.1;
+}
+
+.air-badge-icon {
+  background: transparent;
+  border: none;
+  pointer-events: none;
+}
+
+.air-badge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--air);
+  color: #05141c;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
 .tool-btn:last-child {
   border-bottom: none;
 }

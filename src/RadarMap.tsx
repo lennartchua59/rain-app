@@ -28,6 +28,8 @@ const MSS_BOUNDS = L.latLngBounds(MSS_SOUTH_WEST, MSS_NORTH_EAST)
 
 const WIND_SPEED_API = 'https://api-open.data.gov.sg/v2/real-time/api/wind-speed'
 const WIND_DIRECTION_API = 'https://api-open.data.gov.sg/v2/real-time/api/wind-direction'
+const PSI_API = 'https://api-open.data.gov.sg/v2/real-time/api/psi'
+const PM25_API = 'https://api-open.data.gov.sg/v2/real-time/api/pm25'
 const RAINVIEWER_API = 'https://api.rainviewer.com/public/weather-maps.json'
 // OpenFreeMap's build of the Positron style — the same design as CARTO's
 // Positron raster tiles this app used before CARTO started requiring an API
@@ -1056,6 +1058,95 @@ function WindArrowLayer({ stations, visible }: { stations: StationWind[]; visibl
   return null
 }
 
+type AirMetric = 'psi' | 'pm25'
+type AirReading = { region: string; lat: number; lon: number; value: number }
+const NO_READINGS: AirReading[] = []
+
+// NEA's published bands. PSI is the 24-hour index, PM2.5 is the 1-hour
+// concentration in µg/m³ (the one NEA uses for its hourly health advisory).
+const AIR_BANDS: Record<AirMetric, { max: number; color: string }[]> = {
+  psi: [
+    { max: 50, color: '#3ddc84' },
+    { max: 100, color: '#45a8ff' },
+    { max: 200, color: '#ffb454' },
+    { max: 300, color: '#ff4d5e' },
+    { max: Infinity, color: '#b04bd6' },
+  ],
+  pm25: [
+    { max: 55, color: '#3ddc84' },
+    { max: 150, color: '#45a8ff' },
+    { max: 250, color: '#ffb454' },
+    { max: 350, color: '#ff4d5e' },
+    { max: Infinity, color: '#b04bd6' },
+  ],
+}
+
+function airColor(metric: AirMetric, value: number) {
+  return (AIR_BANDS[metric].find((b) => value <= b.max) ?? AIR_BANDS[metric][0]).color
+}
+
+async function fetchAirReadings(metric: AirMetric): Promise<AirReading[]> {
+  const res = await fetch(metric === 'psi' ? PSI_API : PM25_API)
+  if (!res.ok) throw new Error(`air quality ${res.status}`)
+  const json = await res.json()
+  const regions: { name: string; labelLocation: { latitude: number; longitude: number } }[] =
+    json?.data?.regionMetadata ?? []
+  const items = json?.data?.items ?? []
+  const readings = items[items.length - 1]?.readings?.[metric === 'psi' ? 'psi_twenty_four_hourly' : 'pm25_one_hourly']
+  if (!readings) return []
+  const out: AirReading[] = []
+  for (const r of regions) {
+    const value = readings[r.name]
+    if (typeof value !== 'number' || r.name === 'national') continue
+    out.push({ region: r.name, lat: r.labelLocation.latitude, lon: r.labelLocation.longitude, value })
+  }
+  return out
+}
+
+// Regional air quality badges (west/east/central/south/north), coloured by
+// NEA band. Only fetches while a metric is selected.
+function AirQualityLayer({ metric, refreshKey }: { metric: AirMetric | null; refreshKey: number }) {
+  const map = useMap()
+  const [data, setData] = useState<{ metric: AirMetric; readings: AirReading[] } | null>(null)
+  const readings = data && data.metric === metric ? data.readings : NO_READINGS
+
+  useEffect(() => {
+    if (!metric) return
+    let cancelled = false
+    const load = () =>
+      fetchAirReadings(metric)
+        .then((r) => {
+          if (!cancelled) setData({ metric, readings: r })
+        })
+        .catch(() => {})
+    load()
+    const id = window.setInterval(load, 10 * 60 * 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [metric, refreshKey])
+
+  useEffect(() => {
+    if (!metric) return
+    const group = L.layerGroup().addTo(map)
+    for (const r of readings) {
+      const icon = L.divIcon({
+        className: 'air-badge-icon',
+        html: `<div class="air-badge" style="--air:${airColor(metric, r.value)}">${Math.round(r.value)}</div>`,
+        iconSize: [44, 26],
+        iconAnchor: [22, 13],
+      })
+      L.marker([r.lat, r.lon], { icon, interactive: false, keyboard: false }).addTo(group)
+    }
+    return () => {
+      group.remove()
+    }
+  }, [map, metric, readings])
+
+  return null
+}
+
 // Positron rendered by MapLibre inside Leaflet's tile pane (so radar and
 // markers still stack above it). The canvas gets the .basemap-tile class,
 // whose invert + hue-rotate filter turns the light style into the app's dark
@@ -1138,6 +1229,7 @@ export default function RadarMap() {
   const [radarSource, setRadarSource] = useState<RadarSource>('mss')
   const opacity = radarSource === 'rainviewer' ? RAINVIEWER_LAYER_OPACITY : 0.92
   const [windVisible, setWindVisible] = useState(true)
+  const [airMetric, setAirMetric] = useState<AirMetric | null>(null)
   const [legendOpen, setLegendOpen] = useState(false)
   const [mssFlow, setMssFlow] = useState<FlowStatus | null>(null)
   const [rvFlow, setRvFlow] = useState<FlowStatus | null>(null)
@@ -1425,6 +1517,7 @@ export default function RadarMap() {
             visible={radarSource === 'rainviewer' && !rvFlowReady}
           />
           <WindArrowLayer stations={windField?.stations ?? []} visible={windVisible} />
+          <AirQualityLayer metric={airMetric} refreshKey={refreshKey} />
           <MapResizeHandler />
           <div className="map-tool-stack">
             <MyLocationControl />
@@ -1435,6 +1528,24 @@ export default function RadarMap() {
               aria-pressed={windVisible}
             >
               <IconWind />
+            </button>
+            <button
+              className={`tool-btn tool-btn-text${airMetric === 'psi' ? ' active' : ''}`}
+              onClick={() => setAirMetric((m) => (m === 'psi' ? null : 'psi'))}
+              aria-label="Toggle 24-hour PSI"
+              aria-pressed={airMetric === 'psi'}
+            >
+              <span>24hr</span>
+              <span>PSI</span>
+            </button>
+            <button
+              className={`tool-btn tool-btn-text${airMetric === 'pm25' ? ' active' : ''}`}
+              onClick={() => setAirMetric((m) => (m === 'pm25' ? null : 'pm25'))}
+              aria-label="Toggle 1-hour PM2.5"
+              aria-pressed={airMetric === 'pm25'}
+            >
+              <span>PM</span>
+              <span>2.5</span>
             </button>
           </div>
         </MapContainer>
