@@ -10,6 +10,7 @@
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const DEFAULT_MODEL = 'openai/gpt-oss-120b'
 const MAX_TOOL_ROUNDS = 6
+const MAX_PLACE_SEARCHES = 2
 // Netlify stops a streamed function at 60s; stop starting new model turns
 // well before that so the user gets a clean message instead of a cut-off.
 const DEADLINE_MS = 48_000
@@ -25,16 +26,19 @@ type ChatMessage =
 const NEA_API = 'https://api-open.data.gov.sg/v2/real-time/api'
 const USER_AGENT = 'rainapp-weather-companion/1.0'
 
-const SYSTEM_PROMPT = `You are the weather companion in a rain radar app. Users (mostly in Singapore, but anywhere in the world) describe an outdoor activity, where, when and for how long. Tell them whether to go, and how to stay safe if they go anyway.
+const SYSTEM_PROMPT = `You are the weather companion in a rain radar app. Users (mostly in Singapore, but anywhere in the world) describe something outdoors, where, when and for how long: an activity (a walk, run, ride, picnic, game) or something left outside (a car in an open carpark, laundry). Tell them whether to go, and how to stay safe if they go anyway.
 
 Data:
 - Always fetch live data before judging. Never guess conditions.
-- Location: for well-known places whose coordinates you know, use them directly. Otherwise call search_place. For "here", "near me" or no place, use the device location in the context block. If there is none, ask where in one line.
+- Location: for well-known places whose coordinates you know, use them directly, including Singapore towns and estates (Ang Mo Kio, Tampines, Jurong West...). Otherwise call search_place, once; if it finds nothing, use the nearest town you know. For "here", "near me" or no place, use the device location in the context block. If there is none, ask where in one line.
 - Singapore (lat 1.15-1.48, lon 103.6-104.1): call get_singapore_conditions and get_weather_forecast together. Elsewhere: get_weather_forecast and get_air_quality together.
-- For the next 2 hours, trust NEA's area forecast and the rain gauges most. Use the model's 15-minute and hourly data for timing further out. Tropical showers are patchy and models overstate rain chances, so say how confident you are.
+- Always give get_weather_forecast "durations": every length the user is weighing (e.g. [3, 4]), or one typical length if they didn't say (about 2h for a walk or picnic, 1h for a run, 3h for a ride). Give "start" when they're going later; omit it for now. Its activity_windows are computed exactly: take each window's rain chances, peak, thunder, heat, gusts and daylight from there rather than rereading the hourly table.
+- For the next 2 hours, trust NEA's area forecast and the rain gauges most. Use the model's 15-minute and hourly data for timing further out. Tropical showers are patchy and models overstate rain chances, so say how confident you are. Never say "for sure" or "definitely dry".
+- Rain chance % is the main signal; the mm column is an area average and often shows 0 when showers are likely. An hour at 50%+ is at risk even at 0 mm. Read the chances hour by hour and say whether they rise or fall; don't reverse the trend.
 
 Judging:
-- Compare the activity window (start, now unless stated, to start plus duration) with when rain is expected, and say it plainly, e.g. "You'd be out 5 to 8pm; showers likely from about 7pm, so your last hour is at risk."
+- Judge each window from its activity_windows line and say it plainly, e.g. "You'd be out 5 to 8pm; showers likely from about 7pm, so your last hour is at risk." Say where the risk sits: at the start, the end, or throughout. If the riskiest hours come first, a longer stay adds little risk.
+- When the user weighs several lengths or times, start the "**Why**" bullets with one line per window, e.g. "- 3h (to 10pm): peak 30%, likely dry" and "- 4h (to 11pm): 11pm hour at 60%, at risk".
 - Thunderstorms are the main safety risk. If thundery showers are forecast for that area and time, advise against exposed activities (cycling, open fields, golf, swimming, water sports, exposed trails). Lightning: shelter in a building or car, not under trees or in small open-sided shelters.
 - Haze: quote NEA's band labels exactly as the tools give them; never relabel a number yourself. Hourly PM2.5 shows the air right now better than 24-hour PSI. Exposure grows with breathing rate and time, so a short easy session can be reasonable for a healthy adult when a long hard one is not. Elderly, children, pregnant women and people with heart or lung conditions should be more careful. Outside Singapore use US AQI.
 - Masks: surgical and cloth masks do little against haze. A well-fitted N95 filters it but makes hard exercise uncomfortable, so it suits easy activity only.
@@ -42,14 +46,16 @@ Judging:
 - Mention gusts, UV or darkness after sunset when they matter.
 - Only say conditions will improve later if hourly data you fetched shows it. Haze has no hourly forecast in Singapore, so don't predict when it will ease.
 - Say rain is falling now only if the rain gauges or NEA show it; the model's figures are forecasts.
+- For a later day, NEA's live readings (haze, WBGT, gauges) describe now, not then: say so, and judge heat from the window's feels-like.
 - Don't suggest windows that run past sunset for trails, parks or cycling unless the user is fine with the dark.
+- Something left outside (a parked car, laundry): only rain matters. Skip haze, heat, UV, darkness and masks, and don't suggest shelter the place doesn't have.
 
 Reply (read on a phone, under about 180 words):
 - When the user is deciding about an activity, the first line is exactly one of: "Verdict: Go", "Verdict: Go with care", "Verdict: Hold off", "Verdict: Don't go".
 - A one or two sentence bottom line.
 - "**Why**" with 2-4 "- " bullets citing actual numbers, times and sources (NEA or model).
-- "**If you go**" with precautions specific to this activity and these conditions.
-- A better time window in one line, only if fetched hourly data supports it. Otherwise leave the line out.
+- "**If you go**" with precautions specific to this activity and these conditions. For something left outside, one practical tip instead (e.g. close the windows and sunroof), or nothing.
+- A better time window in one line, only if fetched hourly data supports it and the user could go at another time. Otherwise leave the line out.
 - Use the place's local time. Only **bold** and "- " bullets: no tables or headings.
 - If the user mentions a health condition, add one short line to follow their doctor's advice.
 
@@ -70,13 +76,22 @@ const FUNCTIONS = [
   {
     name: 'get_weather_forecast',
     description:
-      'Model forecast for any point (Open-Meteo): now, 15-minute rain for 3 hours, and hourly rain chance, amount, weather, temperature, feels-like, wet-bulb, wind, gusts, UV. Local times.',
+      'Model forecast for any point (Open-Meteo): now, 15-minute rain for 3 hours, hourly rain chance, amount, weather, temperature, feels-like, wet-bulb, wind, gusts, UV, and a computed summary of each activity window (start plus each duration). Local times.',
     parameters: {
       type: 'object',
       properties: {
         latitude: { type: 'number' },
         longitude: { type: 'number' },
         hours: { type: 'integer', description: 'Hours ahead, 1-48: the activity window plus one' },
+        start: {
+          type: 'string',
+          description: 'When the activity starts, local time "YYYY-MM-DDTHH:MM". Omit for now.',
+        },
+        durations: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Activity lengths in hours to summarise, e.g. [3, 4] when weighing 3h against 4h. Up to 4.',
+        },
       },
       required: ['latitude', 'longitude', 'hours'],
       additionalProperties: false,
@@ -218,29 +233,94 @@ async function searchPlace({ query }: { query: string }) {
   }))
 }
 
-async function getWeatherForecast({ latitude, longitude, hours }: { latitude: number; longitude: number; hours: number }) {
-  const h = Math.min(48, Math.max(1, Math.round(hours)))
+const HOUR_MS = 3_600_000
+// Open-Meteo's local times carry no offset; reading them all as UTC keeps the
+// arithmetic between them right.
+const localMs = (t: string) => Date.parse(`${t.slice(0, 16)}Z`)
+const localTime = (ms: number) => new Date(ms).toISOString().slice(0, 16)
+const hhmm = (t: string) => t.slice(11, 16)
+
+// One activity window summarised in code, so the model reports these figures
+// instead of scanning the hourly table itself (open models were seen calling
+// falling rain chances rising, and reading 0 mm at 72% as dry).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function summariseWindow(j: any, startMs: number, duration: number) {
+  const endMs = startMs + duration * HOUR_MS
+  const label = `${duration}h, ${shortTime(localTime(startMs))} to ${shortTime(localTime(endMs))}`
+  const H = j.hourly
+  const times: string[] = H.time
+  const idx = times.flatMap((t, i) => (localMs(t) < endMs && localMs(t) + HOUR_MS > startMs ? [i] : []))
+  if (idx.length === 0) return `${label}: beyond the forecast`
+  const val = (key: string, i: number): number => H[key][i] ?? 0
+  const max = (key: string) => Math.max(...idx.map((i) => val(key, i)))
+  const peak = idx.reduce((best, i) => (val('precipitation_probability', i) > val('precipitation_probability', best) ? i : best))
+  const thunder = idx.filter((i) => val('weather_code', i) >= 95).map((i) => hhmm(times[i]))
+
+  // Daylight runs from each sunrise to that day's sunset.
+  const sunrises: string[] = j.daily.sunrise
+  const sunsets: string[] = j.daily.sunset
+  const isDark = (ms: number) => !sunrises.some((r, d) => ms >= localMs(r) && ms < localMs(sunsets[d]))
+  const changes = [...sunrises.map((t) => ['sunrise', t]), ...sunsets.map((t) => ['sunset', t])]
+    .filter(([, t]) => localMs(t) > startMs && localMs(t) < endMs)
+    .sort(([, a], [, b]) => localMs(a) - localMs(b))
+    .map(([kind, t]) => `${kind} ${hhmm(t)}`)
+  const light = [`${isDark(startMs) ? 'dark' : 'daylight'} at start`, ...changes].join(', ')
+
+  const lastHour = localMs(times.at(-1)!) + HOUR_MS
+  return (
+    `${label}: rain chance by hour ${idx.map((i) => `${hhmm(times[i])} ${val('precipitation_probability', i)}%`).join(', ')}` +
+    `; peak ${val('precipitation_probability', peak)}% at ${hhmm(times[peak])}` +
+    `; total ${round1(idx.reduce((sum, i) => sum + val('precipitation', i), 0))} mm` +
+    `; thunder ${thunder.length ? `at ${thunder.join(', ')}` : 'none'}` +
+    `; feels up to ${max('apparent_temperature')}°C; gusts up to ${max('wind_gusts_10m')} km/h; UV up to ${max('uv_index')}` +
+    `; ${light}` +
+    (lastHour < endMs ? `; forecast only runs to ${shortTime(localTime(lastHour))}` : '')
+  )
+}
+
+async function getWeatherForecast({
+  latitude,
+  longitude,
+  hours,
+  start,
+  durations,
+}: {
+  latitude: number
+  longitude: number
+  hours: number
+  start?: string
+  durations?: number[]
+}) {
+  // Always fetch the full 48 hours so windows can be summarised wherever they
+  // fall; only the rows asked for are sent back to the model.
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&timezone=auto` +
     '&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,is_day' +
     '&minutely_15=precipitation,weather_code&forecast_minutely_15=12' +
     '&hourly=precipitation_probability,precipitation,weather_code,temperature_2m,apparent_temperature,wet_bulb_temperature_2m,wind_speed_10m,wind_gusts_10m,uv_index' +
-    `&forecast_hours=${h + 1}&daily=sunrise,sunset&forecast_days=${h > 24 ? 3 : 2}`
+    '&forecast_hours=48&daily=sunrise,sunset&forecast_days=3'
   const j = await getJson(url)
   const c = j.current
+  const nowMs = localMs(c.time)
+  const startMs = start ? localMs(start) : nowMs
+  const windows = (durations ?? []).map((d) => summariseWindow(j, startMs, d))
+  // Enough rows to cover the requested hours and every window, plus one.
+  const lastEnd = Math.max(nowMs + hours * HOUR_MS, ...(durations ?? []).map((d) => startMs + d * HOUR_MS))
+  const rows = Math.min(48, Math.max(1, Math.ceil((lastEnd - nowMs) / HOUR_MS) + 1))
   // Rows as compact text tables rather than JSON objects: Groq's free tier
   // caps tokens per minute and per day, and every tool result is resent on
   // each later turn.
   return {
     timezone: j.timezone,
     now: `${c.time}: ${weatherText(c.weather_code)}, ${c.temperature_2m}°C (feels ${c.apparent_temperature}°C), humidity ${c.relative_humidity_2m}%, precipitation ${c.precipitation} mm, wind ${c.wind_speed_10m} km/h gusting ${c.wind_gusts_10m}, ${c.is_day === 1 ? 'daylight' : 'dark'}`,
+    ...(windows.length ? { activity_windows: windows } : {}),
     next_3h_every_15min: ['time | mm | weather'].concat(
       (j.minutely_15.time as string[]).map(
         (t, i) => `${shortTime(t)} | ${j.minutely_15.precipitation[i]} | ${weatherText(j.minutely_15.weather_code[i])}`,
       ),
     ),
     hourly: ['time | rain chance % | mm | weather | °C | feels °C | wet-bulb °C | wind km/h | gusts | UV'].concat(
-      (j.hourly.time as string[]).map((t, i) =>
+      (j.hourly.time as string[]).slice(0, rows).map((t, i) =>
         [
           shortTime(t),
           j.hourly.precipitation_probability[i],
@@ -438,8 +518,26 @@ async function runTool(name: string, input: Record<string, unknown>): Promise<un
       if (typeof input.query !== 'string' || !input.query.trim()) throw new Error('"query" must be a non-empty string')
       return searchPlace({ query: input.query })
     }
-    case 'get_weather_forecast':
-      return getWeatherForecast({ latitude: num(input, 'latitude'), longitude: num(input, 'longitude'), hours: num(input, 'hours') })
+    case 'get_weather_forecast': {
+      const start = input.start
+      if (start != null && (typeof start !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(start))) {
+        throw new Error('"start" must be local time "YYYY-MM-DDTHH:MM"')
+      }
+      const durations = input.durations
+      if (
+        durations != null &&
+        (!Array.isArray(durations) || durations.length > 4 || !durations.every((d) => typeof d === 'number' && d > 0 && d <= 48))
+      ) {
+        throw new Error('"durations" must be up to 4 numbers of hours, each 48 or less')
+      }
+      return getWeatherForecast({
+        latitude: num(input, 'latitude'),
+        longitude: num(input, 'longitude'),
+        hours: num(input, 'hours'),
+        start: start ?? undefined,
+        durations: durations ?? undefined,
+      })
+    }
     case 'get_air_quality':
       return getAirQuality({ latitude: num(input, 'latitude'), longitude: num(input, 'longitude') })
     case 'get_singapore_conditions':
@@ -587,6 +685,7 @@ export default async function handler(req: Request): Promise<Response> {
       try {
         let finished = false
         let retriedToolCall = false
+        let placeSearches = 0
         for (let round = 0; round < MAX_TOOL_ROUNDS && !finished; round++) {
           if (Date.now() - started > DEADLINE_MS) {
             send({ type: 'error', message: 'That took too long to look up. Try asking again, maybe more specifically.' })
@@ -627,6 +726,12 @@ export default async function handler(req: Request): Promise<Response> {
               let output: string
               try {
                 const input = JSON.parse(call.function.arguments || '{}') as Record<string, unknown>
+                // Open models retry search_place with reworded queries for
+                // places they already have, and each round costs free-tier
+                // quota, so cap it.
+                if (call.function.name === 'search_place' && ++placeSearches > MAX_PLACE_SEARCHES) {
+                  throw new Error('Search limit reached. Use the closest result you already have, or coordinates you know.')
+                }
                 send({ type: 'status', text: toolStatus(call.function.name, input) })
                 output = JSON.stringify(await runTool(call.function.name, input))
               } catch (e) {
