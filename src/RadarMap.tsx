@@ -1087,23 +1087,25 @@ function pm25ToPsi(pm: number) {
   return 500
 }
 
-const AIR_BANDS: Record<AirMetric, { max: number; color: string; tag: string }[]> = {
-  psi: [
-    { max: 50, color: '#3ddc84', tag: '1' },
-    { max: 100, color: '#45a8ff', tag: '2' },
-    { max: 200, color: '#ffb454', tag: '3' },
-    { max: 300, color: '#ff4d5e', tag: '4' },
-    { max: Infinity, color: '#b04bd6', tag: '5' },
-  ],
-  get psi1h() {
-    return this.psi
-  },
+type AirBand = { max: number; color: string; tag: string; label: string; range: string }
+
+const PSI_BANDS: AirBand[] = [
+  { max: 50, color: '#3ddc84', tag: '1', label: 'Good', range: '0–50' },
+  { max: 100, color: '#45a8ff', tag: '2', label: 'Moderate', range: '51–100' },
+  { max: 200, color: '#ffb454', tag: '3', label: 'Unhealthy', range: '101–200' },
+  { max: 300, color: '#ff4d5e', tag: '4', label: 'Very unhealthy', range: '201–300' },
+  { max: Infinity, color: '#b04bd6', tag: '5', label: 'Hazardous', range: '301+' },
+]
+
+const AIR_BANDS: Record<AirMetric, AirBand[]> = {
+  psi: PSI_BANDS,
+  psi1h: PSI_BANDS,
   pm25: [
-    { max: 55, color: '#3ddc84', tag: '1' },
-    { max: 150, color: '#45a8ff', tag: '2' },
-    { max: 250, color: '#ffb454', tag: '3' },
-    { max: 350, color: '#ff4d5e', tag: '4' },
-    { max: Infinity, color: '#b04bd6', tag: '5' },
+    { max: 55, color: '#3ddc84', tag: '1', label: 'Normal', range: '0–55' },
+    { max: 150, color: '#45a8ff', tag: '2', label: 'Elevated', range: '56–150' },
+    { max: 250, color: '#ffb454', tag: '3', label: 'High', range: '151–250' },
+    { max: 350, color: '#ff4d5e', tag: '4', label: 'Very high', range: '251–350' },
+    { max: Infinity, color: '#b04bd6', tag: '5', label: 'Extreme', range: '351+' },
   ],
 }
 
@@ -1628,27 +1630,42 @@ export default function RadarMap() {
             the collapsed<->expanded size change and icon<->scale cross-fade
             can actually transition smoothly instead of popping. */}
         <button
-          className={`legend${legendOpen ? ' open' : ''}`}
+          className={`legend${legendOpen ? ' open' : ''}${airMetric ? ' air' : ''}`}
           onClick={() => setLegendOpen((v) => !v)}
           aria-expanded={legendOpen}
-          aria-label={legendOpen ? 'Collapse rain intensity legend' : 'Expand rain intensity legend'}
+          aria-label={`${legendOpen ? 'Collapse' : 'Expand'} ${airMetric ? 'air quality' : 'rain intensity'} legend`}
         >
           <span className="legend-swatch">
             <IconInfo />
           </span>
           <div className="legend-body">
-            <div
-              className="legend-gradient"
-              style={{
-                background: `linear-gradient(to top, ${(radarSource === 'rainviewer' ? RAINVIEWER_LEGEND : MSS_LEGEND).join(',')})`,
-              }}
-            />
-            <div className="legend-ticks">
-              <span>Violent</span>
-              <span>Heavy</span>
-              <span>Moderate</span>
-              <span>Light</span>
-            </div>
+            {airMetric ? (
+              <div className="legend-air">
+                <div className="legend-air-title">{airMetric === 'pm25' ? 'PM2.5 µg/m³' : airMetric === 'psi' ? '24hr PSI' : '1hr PSI (est.)'}</div>
+                {AIR_BANDS[airMetric].map((b) => (
+                  <div className="legend-air-row" key={b.tag} style={{ ['--air' as string]: b.color }}>
+                    <span className="legend-air-dot">{b.tag}</span>
+                    <span className="legend-air-label">{b.label}</span>
+                    <span className="legend-air-range">{b.range}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <>
+                <div
+                  className="legend-gradient"
+                  style={{
+                    background: `linear-gradient(to top, ${(radarSource === 'rainviewer' ? RAINVIEWER_LEGEND : MSS_LEGEND).join(',')})`,
+                  }}
+                />
+                <div className="legend-ticks">
+                  <span>Violent</span>
+                  <span>Heavy</span>
+                  <span>Moderate</span>
+                  <span>Light</span>
+                </div>
+              </>
+            )}
           </div>
         </button>
 
