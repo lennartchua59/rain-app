@@ -24,6 +24,23 @@ export type AnalysisConfig = {
   localRadius: number
 }
 
+export type FlowSourceConfig = AnalysisConfig & {
+  // Gap between the two scans the forecast motion/trend is measured across.
+  // Wider than one scan interval so slow tropical cells move measurably.
+  baselineMin: number
+  // Search radius (analysis cells) around the prior for the baseline motion.
+  searchRadius: number
+  // Search radius around the scaled baseline motion for each scan pair.
+  pairRadius: number
+  // Fraction of the image that must be raining before radar-tracked motion
+  // is trusted over the steering wind. Scattered specks don't track reliably.
+  minCoverage: number
+}
+
+export type MotionSource = 'radar' | 'steering' | 'none'
+
+export type SteeringWind = { u: number; v: number } // km/h east / north
+
 // Below this mean level a block has too little rain to match on and simply
 // inherits the global vector.
 const SIGNAL_FLOOR = 0.6
@@ -33,6 +50,9 @@ const CONFIDENCE_MARGIN = 0.03
 // Overlap needed between the shifted grids for a shift to be scored at all.
 const MIN_OVERLAP = 0.35
 const FLOW_SMOOTH_PASSES = 2
+// Largest disagreement (km/h) between the latest and the previous baseline's
+// motion for the radar-tracked vector to be trusted over the steering wind.
+const MAX_MOTION_DISAGREEMENT_KMH = 12
 
 // Box-averages a full-resolution level image down to an analysis grid.
 export function downsampleLevels(levels: Uint8Array, w: number, h: number, factor: number): Field {
@@ -260,7 +280,7 @@ function smoothField(a: Float32Array, w: number, h: number, passes: number) {
 
 // Bilinear sample of the flow field at analysis-grid cell (x, y), matching
 // how the GPU samples it (texel centres at (i + 0.5) / n, clamped at edges).
-function sampleFlow(flow: FlowField, x: number, y: number, gw: number, gh: number) {
+export function sampleFlow(flow: FlowField, x: number, y: number, gw: number, gh: number) {
   const fx = Math.min(flow.w - 1, Math.max(0, ((x + 0.5) / gw) * flow.w - 0.5))
   const fy = Math.min(flow.h - 1, Math.max(0, ((y + 0.5) / gh) * flow.h - 0.5))
   const x0 = Math.floor(fx)
@@ -277,7 +297,7 @@ function sampleFlow(flow: FlowField, x: number, y: number, gw: number, gh: numbe
   return { u: at(flow.u), v: at(flow.v) }
 }
 
-function sampleField(f: Field, x: number, y: number): number | null {
+export function sampleField(f: Field, x: number, y: number): number | null {
   if (x < 0 || y < 0 || x > f.w - 1 || y > f.h - 1) return null
   const x0 = Math.floor(x)
   const y0 = Math.floor(y)
@@ -313,4 +333,89 @@ export function estimateTrend(prev: Field, curr: Field, flow: FlowField, maxDelt
   }
   smoothField(data, w, h, 3)
   return { data, w, h }
+}
+
+export type NowcastMotion = {
+  flow: FlowField
+  trend: Field | null
+  source: MotionSource
+  // Domain-wide motion in analysis cells over the baseline.
+  dx: number
+  dy: number
+}
+
+// The forecast motion: how the latest scan's rain will keep moving. Tracked
+// from the radar across the baseline when that's trustworthy, otherwise the
+// steering wind (`prior`, in cells over the baseline; null when unknown).
+export function measureNowcastMotion({
+  latest,
+  prev,
+  prev2,
+  dt,
+  dt2,
+  prior,
+  cellKmX,
+  cellKmY,
+  config,
+}: {
+  latest: Field
+  // The scan one baseline before `latest`, and the one a baseline before
+  // that, with their gaps in minutes.
+  prev: Field | null
+  prev2: Field | null
+  dt: number
+  dt2: number
+  prior: { dx: number; dy: number } | null
+  cellKmX: number
+  cellKmY: number
+  config: FlowSourceConfig
+}): NowcastMotion {
+  const guess = prior ?? { dx: 0, dy: 0 }
+  let flow: FlowField | null = null
+  let trend: Field | null = null
+  let source: MotionSource = 'none'
+  let gdx = 0
+  let gdy = 0
+  if (prev) {
+    const shift = estimateGlobalShift(prev, latest, guess.dx, guess.dy, config.searchRadius)
+    // Independent check one baseline earlier: real storm motion holds
+    // steady over a quarter hour, noise doesn't. Backtests showed
+    // scattered showers producing confident-looking but random vectors
+    // that this rejects.
+    let consistent = true
+    if (shift?.confident && prev2) {
+      const k = dt2 / dt
+      const earlier = estimateGlobalShift(prev2, prev, guess.dx * k, guess.dy * k, config.searchRadius)
+      if (earlier?.confident) {
+        const du = (shift.dx / dt - earlier.dx / dt2) * cellKmX * 60
+        const dv = (shift.dy / dt - earlier.dy / dt2) * cellKmY * 60
+        consistent = Math.hypot(du, dv) <= MAX_MOTION_DISAGREEMENT_KMH
+      } else if (earlier) {
+        consistent = false
+      }
+    }
+    let raining = 0
+    for (const x of latest.data) if (x >= 0.5) raining++
+    const enoughRain = raining / latest.data.length >= config.minCoverage
+    if (shift?.confident && consistent && (enoughRain || !prior)) {
+      gdx = shift.dx
+      gdy = shift.dy
+      source = 'radar'
+    } else if (prior) {
+      gdx = prior.dx
+      gdy = prior.dy
+      source = 'steering'
+    }
+    flow =
+      source === 'radar'
+        ? estimateFlowField(prev, latest, gdx, gdy, { ...config, localRadius: config.localRadius + 2 })
+        : uniformFlow(gdx, gdy)
+    trend = estimateTrend(prev, latest, flow, 6)
+  } else if (prior) {
+    gdx = prior.dx
+    gdy = prior.dy
+    source = 'steering'
+    flow = uniformFlow(gdx, gdy)
+  }
+  return { flow: flow ?? uniformFlow(0, 0), trend, source, dx: gdx, dy: gdy }
 }

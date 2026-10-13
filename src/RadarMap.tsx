@@ -18,12 +18,19 @@ import {
   type SteeringWind,
 } from './radar/FlowRadarLayer'
 import { MSS_PALETTE, RAINVIEWER_PALETTE, legendStops } from './radar/palette'
+import {
+  MSS_FLOW_CONFIG,
+  MSS_NORTH_EAST,
+  MSS_SOUTH_WEST,
+  STEERING_API,
+  floorToSgFiveMin,
+  mssImagePath,
+  mssImageUrl,
+  steeringFromResponse,
+} from './radar/mss'
 
 const SINGAPORE: [number, number] = [1.3521, 103.8198]
 
-// Bounding box of MSS's own rain-area radar composite (same source their site embeds).
-const MSS_SOUTH_WEST: L.LatLngTuple = [1.156, 103.565]
-const MSS_NORTH_EAST: L.LatLngTuple = [1.475, 104.13]
 const MSS_BOUNDS = L.latLngBounds(MSS_SOUTH_WEST, MSS_NORTH_EAST)
 
 const WIND_SPEED_API = 'https://api-open.data.gov.sg/v2/real-time/api/wind-speed'
@@ -36,14 +43,6 @@ const RAINVIEWER_API = 'https://api.rainviewer.com/public/weather-maps.json'
 // key, but free and keyless. Vector, so it stays sharp at every zoom.
 const BASEMAP_STYLE = 'https://tiles.openfreemap.org/styles/positron'
 setWorkerUrl(maplibreWorkerUrl)
-// Rain cells are carried by the wind 1.5-3km up, not the surface wind the
-// weather stations measure (which is slowed and turned by friction, and
-// often points a different way entirely). Open-Meteo's 850/700 hPa model wind
-// over Singapore is the standard "steering flow" first guess for storm motion.
-const STEERING_API =
-  'https://api.open-meteo.com/v1/forecast?latitude=1.35&longitude=103.82' +
-  '&hourly=wind_speed_850hPa,wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa' +
-  '&past_hours=2&forecast_hours=4&timezone=UTC'
 // Same-origin path to MSS's radar images (see vite.config.ts), so their
 // pixels can be read for motion tracking.
 const MSS_PROXY_BASE = '/mss-radar'
@@ -126,23 +125,9 @@ const RAINVIEWER_WINDOW_BOUNDS = L.latLngBounds(
 const MSS_LEGEND = legendStops(MSS_PALETTE, 10)
 const RAINVIEWER_LEGEND = legendStops(RAINVIEWER_PALETTE, 10)
 
-// Motion-analysis tuning per source. MSS images are 217x120px over ~63x35km
-// (~0.3km/px) with a scan every 5 min; RainViewer's window is 768px over
-// ~470km (~0.6km/px) every 10 min. Analysis cells end up ~0.6km (MSS) and
-// ~2.4km (RainViewer), and search radii cover storm motion up to roughly
-// 40km/h either side of the steering-wind first guess.
-const MSS_FLOW_CONFIG: FlowSourceConfig = {
-  factor: 2,
-  flowCell: 8,
-  blockHalf: 8,
-  localRadius: 3,
-  baselineMin: 15,
-  searchRadius: 16,
-  pairRadius: 6,
-  // ~90 km² of this 63x35km image. Below that it's scattered specks, whose
-  // tracked "motion" was measured jumping around at random.
-  minCoverage: 0.04,
-}
+// Motion-analysis tuning for RainViewer (MSS's is in radar/mss.ts): its
+// window is 768px over ~470km (~0.6km/px) every 10 min, so analysis cells
+// end up ~2.4km.
 const RAINVIEWER_FLOW_CONFIG: FlowSourceConfig = {
   factor: 4,
   flowCell: 12,
@@ -296,39 +281,6 @@ function IconPause({ size = 13 }: { size?: number }) {
   )
 }
 
-function pad(n: number) {
-  return String(n).padStart(2, '0')
-}
-
-// Returns the SGT wall-clock field values for a real UTC epoch, computed manually
-// (not via the browser's local timezone) so this works correctly for any viewer.
-function sgFields(epoch: number) {
-  const d = new Date(epoch + 8 * 3600 * 1000)
-  return {
-    y: d.getUTCFullYear(),
-    mo: d.getUTCMonth() + 1,
-    da: d.getUTCDate(),
-    h: d.getUTCHours(),
-    mi: d.getUTCMinutes(),
-  }
-}
-
-function floorToSgFiveMin(epoch: number) {
-  const sgMs = epoch + 8 * 3600 * 1000
-  const flooredSg = Math.floor(sgMs / (5 * 60 * 1000)) * 5 * 60 * 1000
-  return flooredSg - 8 * 3600 * 1000
-}
-
-function mssImagePath(epoch: number) {
-  const { y, mo, da, h, mi } = sgFields(epoch)
-  const dt = `${y}${pad(mo)}${pad(da)}${pad(h)}${pad(mi)}`
-  return `/50km/v2/dpsri_70km_${dt}0000dBR.dpsri.png`
-}
-
-function mssImageUrl(epoch: number) {
-  return `https://www.weather.gov.sg/files/rainarea${mssImagePath(epoch)}`
-}
-
 function formatTime(epoch: number) {
   return new Date(epoch).toLocaleTimeString('en-SG', {
     hour: '2-digit',
@@ -473,32 +425,12 @@ async function fetchWindField(): Promise<WindField | null> {
   }
 }
 
-// Model steering wind over Singapore for the current hour: the vector mean of
-// the 850 and 700 hPa winds, as east/north km/h.
+// Model steering wind over Singapore for the current hour (see radar/mss.ts).
 async function fetchSteeringWind(): Promise<SteeringWind | null> {
   try {
     const res = await fetch(STEERING_API)
     if (!res.ok) return null
-    const json = await res.json()
-    const h = json.hourly
-    const times: number[] = h.time.map((t: string) => Date.parse(`${t}Z`))
-    let best = 0
-    for (let i = 1; i < times.length; i++) {
-      if (Math.abs(times[i] - Date.now()) < Math.abs(times[best] - Date.now())) best = i
-    }
-    let u = 0
-    let v = 0
-    let n = 0
-    for (const level of ['850hPa', '700hPa']) {
-      const speed = h[`wind_speed_${level}`]?.[best]
-      const from = h[`wind_direction_${level}`]?.[best]
-      if (typeof speed !== 'number' || typeof from !== 'number') continue
-      const rad = (from * Math.PI) / 180
-      u += -speed * Math.sin(rad)
-      v += -speed * Math.cos(rad)
-      n++
-    }
-    return n > 0 ? { u: u / n, v: v / n } : null
+    return steeringFromResponse(await res.json(), Date.now())
   } catch {
     return null
   }

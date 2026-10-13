@@ -7,6 +7,8 @@
 
 // Groq's OpenAI-compatible chat API. Any Groq model with tool use works;
 // override with GROQ_MODEL without a code change.
+import { radarNowcast } from '../lib/radarNowcast.ts'
+
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const DEFAULT_MODEL = 'openai/gpt-oss-120b'
 const MAX_TOOL_ROUNDS = 6
@@ -31,9 +33,10 @@ const SYSTEM_PROMPT = `You are the weather companion in a rain radar app. Users 
 Data:
 - Always fetch live data before judging. Never guess conditions.
 - Location: for well-known places whose coordinates you know, use them directly, including Singapore towns and estates (Ang Mo Kio, Tampines, Jurong West...). Otherwise call search_place, once; if it finds nothing, use the nearest town you know. For "here", "near me" or no place, use the device location in the context block. If there is none, ask where in one line.
-- Singapore (lat 1.15-1.48, lon 103.6-104.1): call get_singapore_conditions and get_weather_forecast together. Elsewhere: get_weather_forecast and get_air_quality together.
+- Singapore (lat 1.15-1.48, lon 103.6-104.1): call get_singapore_conditions and get_weather_forecast together, plus get_radar_nowcast when the window starts within 2 hours. Elsewhere: get_weather_forecast and get_air_quality together.
 - Always give get_weather_forecast "durations": every length the user is weighing (e.g. [3, 4]), or one typical length if they didn't say (about 2h for a walk or picnic, 1h for a run, 3h for a ride). Give "start" when they're going later; omit it for now. Its activity_windows are computed exactly: take each window's rain chances, peak, thunder, heat, gusts and daylight from there rather than rereading the hourly table.
 - For the next 2 hours, trust NEA's area forecast and the rain gauges most. Use the model's 15-minute and hourly data for timing further out. Tropical showers are patchy and models overstate rain chances, so say how confident you are. Never say "for sure" or "definitely dry".
+- Radar nowcast: the best guide to the next hour, and the answer to "will the rain I see on the radar reach me". If it shows rain arriving, give the time and how long it lasts. It only sees rain that already exists, so if it's dry but NEA or the model expect showers, say showers could still form overhead. Past its coverage time or about an hour, rely on NEA and the model. Faint "very light" echoes often don't reach the ground.
 - Rain chance % is the main signal; the mm column is an area average and often shows 0 when showers are likely. An hour at 50%+ is at risk even at 0 mm. Read the chances hour by hour and say whether they rise or fall; don't reverse the trend.
 
 Judging:
@@ -119,6 +122,17 @@ const FUNCTIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'get_radar_nowcast',
+    description:
+      "Singapore only. Tracks the rain on MSS's live radar and extrapolates its motion to a point for up to 2 hours: rain there now, nearest rain, which way it's moving, and when rain should arrive and clear.",
+    parameters: {
+      type: 'object',
+      properties: { latitude: { type: 'number' }, longitude: { type: 'number' } },
+      required: ['latitude', 'longitude'],
+      additionalProperties: false,
+    },
+  },
 ]
 
 const TOOLS = FUNCTIONS.map((fn) => ({ type: 'function' as const, function: fn }))
@@ -134,6 +148,8 @@ function toolStatus(name: string, input: Record<string, unknown>) {
       return 'Checking air quality'
     case 'get_singapore_conditions':
       return 'Reading NEA live data'
+    case 'get_radar_nowcast':
+      return 'Tracking rain on the radar'
     default:
       return 'Working'
   }
@@ -540,6 +556,8 @@ async function runTool(name: string, input: Record<string, unknown>): Promise<un
     }
     case 'get_air_quality':
       return getAirQuality({ latitude: num(input, 'latitude'), longitude: num(input, 'longitude') })
+    case 'get_radar_nowcast':
+      return radarNowcast(num(input, 'latitude'), num(input, 'longitude'))
     case 'get_singapore_conditions':
       return getSingaporeConditions({ latitude: num(input, 'latitude'), longitude: num(input, 'longitude') })
     default:
