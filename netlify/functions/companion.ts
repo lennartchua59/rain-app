@@ -489,11 +489,13 @@ function cleanHistory(history: unknown): ChatMessage[] | null {
     const msg = m as Record<string, unknown>
     if (msg.role === 'user' && typeof msg.content === 'string') {
       out.push({ role: 'user', content: msg.content })
-    } else if (msg.role === 'assistant' && (typeof msg.content === 'string' || msg.content === null)) {
+    } else if (msg.role === 'assistant' && (typeof msg.content === 'string' || msg.content == null)) {
+      // Groq leaves content out entirely on a turn that only calls tools.
+      const content = typeof msg.content === 'string' ? msg.content : null
       out.push(
         Array.isArray(msg.tool_calls)
-          ? { role: 'assistant', content: msg.content, tool_calls: msg.tool_calls as ToolCall[] }
-          : { role: 'assistant', content: msg.content },
+          ? { role: 'assistant', content, tool_calls: msg.tool_calls as ToolCall[] }
+          : { role: 'assistant', content },
       )
     } else if (msg.role === 'tool' && typeof msg.tool_call_id === 'string' && typeof msg.content === 'string') {
       out.push({ role: 'tool', tool_call_id: msg.tool_call_id, content: msg.content })
@@ -610,7 +612,8 @@ export default async function handler(req: Request): Promise<Response> {
             }
             throw e
           }
-          const { content, tool_calls } = choice.message
+          const content = choice.message.content ?? null
+          const tool_calls = choice.message.tool_calls
           const toolCalls = tool_calls ?? []
           appended.push(toolCalls.length ? { role: 'assistant', content, tool_calls: toolCalls } : { role: 'assistant', content })
           if (content) send({ type: 'text', delta: content })
