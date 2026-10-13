@@ -1,0 +1,664 @@
+// The in-app weather companion. The browser posts the conversation so far plus
+// the new question; this runs an open model on Groq's free tier with a few
+// live-data tools (forecast, air quality, NEA's official Singapore feeds, place
+// search) and streams progress and the reply back as newline-delimited JSON.
+// Served at /api/companion on Netlify, and by a Vite middleware in dev (see
+// vite.config.ts).
+
+// Groq's OpenAI-compatible chat API. Any Groq model with tool use works;
+// override with GROQ_MODEL without a code change.
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+const DEFAULT_MODEL = 'openai/gpt-oss-120b'
+const MAX_TOOL_ROUNDS = 6
+// Netlify stops a streamed function at 60s; stop starting new model turns
+// well before that so the user gets a clean message instead of a cut-off.
+const DEADLINE_MS = 48_000
+const MAX_HISTORY_BYTES = 200_000
+const MAX_QUESTION_CHARS = 2_000
+
+type ToolCall = { id: string; type: 'function'; function: { name: string; arguments: string } }
+type ChatMessage =
+  | { role: 'system' | 'user'; content: string }
+  | { role: 'assistant'; content: string | null; tool_calls?: ToolCall[] }
+  | { role: 'tool'; tool_call_id: string; content: string }
+
+const NEA_API = 'https://api-open.data.gov.sg/v2/real-time/api'
+const USER_AGENT = 'rainapp-weather-companion/1.0'
+
+const SYSTEM_PROMPT = `You are the weather companion in a rain radar app. Users (mostly in Singapore, but anywhere in the world) describe an outdoor activity, where, when and for how long. Tell them whether to go, and how to stay safe if they go anyway.
+
+Data:
+- Always fetch live data before judging. Never guess conditions.
+- Location: for well-known places whose coordinates you know, use them directly. Otherwise call search_place. For "here", "near me" or no place, use the device location in the context block. If there is none, ask where in one line.
+- Singapore (lat 1.15-1.48, lon 103.6-104.1): call get_singapore_conditions and get_weather_forecast together. Elsewhere: get_weather_forecast and get_air_quality together.
+- For the next 2 hours, trust NEA's area forecast and the rain gauges most. Use the model's 15-minute and hourly data for timing further out. Tropical showers are patchy and models overstate rain chances, so say how confident you are.
+
+Judging:
+- Compare the activity window (start, now unless stated, to start plus duration) with when rain is expected, and say it plainly, e.g. "You'd be out 5 to 8pm; showers likely from about 7pm, so your last hour is at risk."
+- Thunderstorms are the main safety risk. If thundery showers are forecast for that area and time, advise against exposed activities (cycling, open fields, golf, swimming, water sports, exposed trails). Lightning: shelter in a building or car, not under trees or in small open-sided shelters.
+- Haze: quote NEA's band labels exactly as the tools give them; never relabel a number yourself. Hourly PM2.5 shows the air right now better than 24-hour PSI. Exposure grows with breathing rate and time, so a short easy session can be reasonable for a healthy adult when a long hard one is not. Elderly, children, pregnant women and people with heart or lung conditions should be more careful. Outside Singapore use US AQI.
+- Masks: surgical and cloth masks do little against haze. A well-fitted N95 filters it but makes hard exercise uncomfortable, so it suits easy activity only.
+- Heat: NEA WBGT below 31°C low, 31-33 moderate, 33+ high. Elsewhere use feels-like temperature.
+- Mention gusts, UV or darkness after sunset when they matter.
+- Only say conditions will improve later if hourly data you fetched shows it. Haze has no hourly forecast in Singapore, so don't predict when it will ease.
+- Say rain is falling now only if the rain gauges or NEA show it; the model's figures are forecasts.
+- Don't suggest windows that run past sunset for trails, parks or cycling unless the user is fine with the dark.
+
+Reply (read on a phone, under about 180 words):
+- When the user is deciding about an activity, the first line is exactly one of: "Verdict: Go", "Verdict: Go with care", "Verdict: Hold off", "Verdict: Don't go".
+- A one or two sentence bottom line.
+- "**Why**" with 2-4 "- " bullets citing actual numbers, times and sources (NEA or model).
+- "**If you go**" with precautions specific to this activity and these conditions.
+- A better time window in one line, only if fetched hourly data supports it. Otherwise leave the line out.
+- Use the place's local time. Only **bold** and "- " bullets: no tables or headings.
+- If the user mentions a health condition, add one short line to follow their doctor's advice.
+
+Each user message starts with a <context> block from the app (current time, device location if shared). The user didn't write it.`
+
+const FUNCTIONS = [
+  {
+    name: 'search_place',
+    description:
+      'Coordinates of a named place anywhere (park, street, landmark, city). Up to 3 candidates. Add the city or country, e.g. "Punggol Waterway, Singapore".',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'Place name, e.g. "MacRitchie Reservoir, Singapore"' } },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_weather_forecast',
+    description:
+      'Model forecast for any point (Open-Meteo): now, 15-minute rain for 3 hours, and hourly rain chance, amount, weather, temperature, feels-like, wet-bulb, wind, gusts, UV. Local times.',
+    parameters: {
+      type: 'object',
+      properties: {
+        latitude: { type: 'number' },
+        longitude: { type: 'number' },
+        hours: { type: 'integer', description: 'Hours ahead, 1-48: the activity window plus one' },
+      },
+      required: ['latitude', 'longitude', 'hours'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_air_quality',
+    description:
+      'Modelled air quality for any point outside Singapore: PM2.5, PM10, US AQI now and for 12 hours.',
+    parameters: {
+      type: 'object',
+      properties: { latitude: { type: 'number' }, longitude: { type: 'number' } },
+      required: ['latitude', 'longitude'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'get_singapore_conditions',
+    description:
+      "Official live NEA data near a Singapore point: 2-hour area forecast, rain gauges (last 5 min), PSI and PM2.5 with NEA bands, WBGT heat stress.",
+    parameters: {
+      type: 'object',
+      properties: { latitude: { type: 'number' }, longitude: { type: 'number' } },
+      required: ['latitude', 'longitude'],
+      additionalProperties: false,
+    },
+  },
+]
+
+const TOOLS = FUNCTIONS.map((fn) => ({ type: 'function' as const, function: fn }))
+
+// Short status line shown in the chat while a tool runs.
+function toolStatus(name: string, input: Record<string, unknown>) {
+  switch (name) {
+    case 'search_place':
+      return `Finding ${String(input.query ?? 'the place')}`
+    case 'get_weather_forecast':
+      return 'Checking the forecast'
+    case 'get_air_quality':
+      return 'Checking air quality'
+    case 'get_singapore_conditions':
+      return 'Reading NEA live data'
+    default:
+      return 'Working'
+  }
+}
+
+// ---------- Tool implementations ----------
+
+const WMO_CODES: Record<number, string> = {
+  0: 'clear',
+  1: 'mainly clear',
+  2: 'partly cloudy',
+  3: 'overcast',
+  45: 'fog',
+  48: 'rime fog',
+  51: 'light drizzle',
+  53: 'drizzle',
+  55: 'heavy drizzle',
+  56: 'freezing drizzle',
+  57: 'freezing drizzle',
+  61: 'light rain',
+  63: 'rain',
+  65: 'heavy rain',
+  66: 'freezing rain',
+  67: 'freezing rain',
+  71: 'light snow',
+  73: 'snow',
+  75: 'heavy snow',
+  77: 'snow grains',
+  80: 'light showers',
+  81: 'showers',
+  82: 'violent showers',
+  85: 'snow showers',
+  86: 'heavy snow showers',
+  95: 'thunderstorm',
+  96: 'thunderstorm with hail',
+  99: 'thunderstorm with heavy hail',
+}
+
+function weatherText(code: unknown) {
+  return typeof code === 'number' ? (WMO_CODES[code] ?? `code ${code}`) : null
+}
+
+function distanceKm(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const rad = Math.PI / 180
+  const dLat = (lat2 - lat1) * rad
+  const dLon = (lon2 - lon1) * rad
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2
+  return 6371 * 2 * Math.asin(Math.sqrt(a))
+}
+
+const round1 = (n: number) => Math.round(n * 10) / 10
+
+// "2026-10-13T17:00" -> "10-13 17:00"
+const shortTime = (t: string) => t.slice(5).replace('T', ' ')
+
+// Untyped on purpose: each caller reads the handful of fields it needs from
+// these third-party payloads.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getJson(url: string, headers: Record<string, string> = {}): Promise<any> {
+  const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT, ...headers }, signal: AbortSignal.timeout(10_000) })
+  if (!res.ok) throw new Error(`${new URL(url).hostname} responded ${res.status}`)
+  return res.json()
+}
+
+function neaHeaders(): Record<string, string> {
+  const key = process.env.DATA_GOV_SG_API_KEY
+  return key ? { 'x-api-key': key } : {}
+}
+
+async function searchPlace({ query }: { query: string }) {
+  type NominatimHit = { name: string; display_name: string; lat: string; lon: string; type: string }
+  const hits: NominatimHit[] = await getJson(
+    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=3&q=${encodeURIComponent(query)}`,
+  )
+  if (hits.length > 0) {
+    return hits.map((h) => ({
+      name: h.name,
+      address: h.display_name,
+      kind: h.type,
+      latitude: Number(h.lat),
+      longitude: Number(h.lon),
+    }))
+  }
+  // OSM search can miss loosely-worded queries; Open-Meteo's gazetteer knows
+  // towns and cities by name.
+  const fallback = await getJson(
+    `https://geocoding-api.open-meteo.com/v1/search?count=3&name=${encodeURIComponent(query)}`,
+  )
+  const results: { name: string; country?: string; admin1?: string; latitude: number; longitude: number }[] =
+    fallback.results ?? []
+  if (results.length === 0) return { error: `No place found for "${query}". Try a broader or differently worded name.` }
+  return results.map((r) => ({
+    name: r.name,
+    address: [r.name, r.admin1, r.country].filter(Boolean).join(', '),
+    latitude: r.latitude,
+    longitude: r.longitude,
+  }))
+}
+
+async function getWeatherForecast({ latitude, longitude, hours }: { latitude: number; longitude: number; hours: number }) {
+  const h = Math.min(48, Math.max(1, Math.round(hours)))
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&timezone=auto` +
+    '&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,is_day' +
+    '&minutely_15=precipitation,weather_code&forecast_minutely_15=12' +
+    '&hourly=precipitation_probability,precipitation,weather_code,temperature_2m,apparent_temperature,wet_bulb_temperature_2m,wind_speed_10m,wind_gusts_10m,uv_index' +
+    `&forecast_hours=${h + 1}&daily=sunrise,sunset&forecast_days=${h > 24 ? 3 : 2}`
+  const j = await getJson(url)
+  const c = j.current
+  // Rows as compact text tables rather than JSON objects: Groq's free tier
+  // caps tokens per minute and per day, and every tool result is resent on
+  // each later turn.
+  return {
+    timezone: j.timezone,
+    now: `${c.time}: ${weatherText(c.weather_code)}, ${c.temperature_2m}°C (feels ${c.apparent_temperature}°C), humidity ${c.relative_humidity_2m}%, precipitation ${c.precipitation} mm, wind ${c.wind_speed_10m} km/h gusting ${c.wind_gusts_10m}, ${c.is_day === 1 ? 'daylight' : 'dark'}`,
+    next_3h_every_15min: ['time | mm | weather'].concat(
+      (j.minutely_15.time as string[]).map(
+        (t, i) => `${shortTime(t)} | ${j.minutely_15.precipitation[i]} | ${weatherText(j.minutely_15.weather_code[i])}`,
+      ),
+    ),
+    hourly: ['time | rain chance % | mm | weather | °C | feels °C | wet-bulb °C | wind km/h | gusts | UV'].concat(
+      (j.hourly.time as string[]).map((t, i) =>
+        [
+          shortTime(t),
+          j.hourly.precipitation_probability[i],
+          j.hourly.precipitation[i],
+          weatherText(j.hourly.weather_code[i]),
+          j.hourly.temperature_2m[i],
+          j.hourly.apparent_temperature[i],
+          j.hourly.wet_bulb_temperature_2m[i],
+          j.hourly.wind_speed_10m[i],
+          j.hourly.wind_gusts_10m[i],
+          j.hourly.uv_index[i],
+        ].join(' | '),
+      ),
+    ),
+    sunrise: (j.daily.sunrise as string[]).map(shortTime),
+    sunset: (j.daily.sunset as string[]).map(shortTime),
+  }
+}
+
+async function getAirQuality({ latitude, longitude }: { latitude: number; longitude: number }) {
+  const j = await getJson(
+    `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${latitude}&longitude=${longitude}&timezone=auto` +
+      '&current=pm2_5,pm10,us_aqi,ozone&hourly=pm2_5,us_aqi&forecast_hours=12',
+  )
+  return {
+    source: 'Open-Meteo CAMS model (about 10-40 km resolution), not a ground station',
+    now: `${j.current.time}: PM2.5 ${j.current.pm2_5} µg/m³, PM10 ${j.current.pm10}, US AQI ${j.current.us_aqi}, ozone ${j.current.ozone}`,
+    hourly: ['time | PM2.5 µg/m³ | US AQI'].concat(
+      (j.hourly.time as string[]).map((t, i) => `${shortTime(t)} | ${j.hourly.pm2_5[i]} | ${j.hourly.us_aqi[i]}`),
+    ),
+  }
+}
+
+// NEA's PM2.5 sub-index breakpoints (µg/m³ -> index), the same conversion the
+// app's "1hr PSI" map badges use.
+const PM25_TO_PSI: [number, number][] = [
+  [0, 0],
+  [12, 50],
+  [55, 100],
+  [150, 200],
+  [250, 300],
+  [350, 400],
+  [500, 500],
+]
+
+function pm25ToPsi(pm: number) {
+  for (let i = 1; i < PM25_TO_PSI.length; i++) {
+    const [c1, i1] = PM25_TO_PSI[i]
+    if (pm <= c1) {
+      const [c0, i0] = PM25_TO_PSI[i - 1]
+      return Math.round(i0 + ((pm - c0) / (c1 - c0)) * (i1 - i0))
+    }
+  }
+  return 500
+}
+
+// NEA's published bands, attached to each reading so the model quotes NEA's
+// own label instead of classifying the number itself (open models were seen
+// calling PSI 149 "moderate").
+function psiBand(psi: number) {
+  if (psi <= 50) return 'good (0-50)'
+  if (psi <= 100) return 'moderate (51-100): normal activities'
+  if (psi <= 200) return 'unhealthy (101-200): healthy people reduce prolonged or strenuous outdoor exertion'
+  if (psi <= 300) return 'very unhealthy (201-300): avoid prolonged or strenuous outdoor exertion'
+  return 'hazardous (above 300): avoid outdoor activity'
+}
+
+function pm25Band(pm: number) {
+  if (pm <= 55) return 'band I normal (0-55)'
+  if (pm <= 150) return 'band II elevated (56-150)'
+  if (pm <= 250) return 'band III high (151-250)'
+  return 'band IV very high (above 250)'
+}
+
+// Each feed is fetched independently so one failure (data.gov.sg rate-limits
+// keyless callers) only blanks its own section.
+async function settle<T>(p: Promise<T>): Promise<T | { error: string }> {
+  try {
+    return await p
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : 'unavailable' }
+  }
+}
+
+async function neaTwoHour(lat: number, lon: number) {
+  const j = await getJson(`${NEA_API}/two-hr-forecast`, neaHeaders())
+  const areas: { name: string; label_location: { latitude: number; longitude: number } }[] = j.data.area_metadata
+  const item = j.data.items[0]
+  const byArea = new Map<string, string>(item.forecasts.map((f: { area: string; forecast: string }) => [f.area, f.forecast]))
+  const nearest = areas
+    .map((a) => ({
+      area: a.name,
+      distance_km: round1(distanceKm(lat, lon, a.label_location.latitude, a.label_location.longitude)),
+      forecast: byArea.get(a.name),
+    }))
+    .sort((a, b) => a.distance_km - b.distance_km)
+    .slice(0, 4)
+  const all = [...byArea.values()]
+  return {
+    valid: item.valid_period.text,
+    nearest_areas: nearest,
+    island_wide: {
+      areas: all.length,
+      thundery: all.filter((f) => /thunder/i.test(f)).length,
+      showers_or_rain: all.filter((f) => /shower|rain/i.test(f) && !/thunder/i.test(f)).length,
+    },
+  }
+}
+
+async function neaRainfall(lat: number, lon: number) {
+  const j = await getJson(`${NEA_API}/rainfall`, neaHeaders())
+  const stations: { id: string; name: string; location: { latitude: number; longitude: number } }[] = j.data.stations
+  const reading = j.data.readings[0]
+  const value = new Map<string, number>(reading.data.map((r: { stationId: string; value: number }) => [r.stationId, r.value]))
+  const withDistance = stations
+    .filter((s) => value.has(s.id))
+    .map((s) => ({
+      station: s.name,
+      distance_km: round1(distanceKm(lat, lon, s.location.latitude, s.location.longitude)),
+      mm_last_5min: value.get(s.id)!,
+    }))
+    .sort((a, b) => a.distance_km - b.distance_km)
+  const raining = withDistance.filter((s) => s.mm_last_5min > 0)
+  return {
+    time: reading.timestamp,
+    nearest_gauges: withDistance.slice(0, 4),
+    gauges_with_rain_within_10km: raining.filter((s) => s.distance_km <= 10),
+    gauges_with_rain_island_wide: `${raining.length} of ${withDistance.length}`,
+  }
+}
+
+async function neaAir(lat: number, lon: number) {
+  const [psi, pm] = await Promise.all([getJson(`${NEA_API}/psi`, neaHeaders()), getJson(`${NEA_API}/pm25`, neaHeaders())])
+  const regions: { name: string; labelLocation: { latitude: number; longitude: number } }[] = psi.data.regionMetadata.filter(
+    (r: { name: string }) => r.name !== 'national',
+  )
+  const region = regions.reduce((best, r) =>
+    distanceKm(lat, lon, r.labelLocation.latitude, r.labelLocation.longitude) <
+    distanceKm(lat, lon, best.labelLocation.latitude, best.labelLocation.longitude)
+      ? r
+      : best,
+  ).name
+  const psiItem = psi.data.items.at(-1)
+  const pmItem = pm.data.items.at(-1)
+  const pm1h: number | undefined = pmItem?.readings?.pm25_one_hourly?.[region]
+  const psi24: number | undefined = psiItem?.readings?.psi_twenty_four_hourly?.[region]
+  return {
+    region,
+    updated: psiItem?.updatedTimestamp ?? psiItem?.timestamp,
+    psi_24h: typeof psi24 === 'number' ? `${psi24}, ${psiBand(psi24)}` : undefined,
+    pm25_1h: typeof pm1h === 'number' ? `${pm1h} µg/m³, ${pm25Band(pm1h)}` : undefined,
+    pm25_1h_as_psi_estimate: typeof pm1h === 'number' ? `${pm25ToPsi(pm1h)}, ${psiBand(pm25ToPsi(pm1h))}` : undefined,
+  }
+}
+
+async function neaHeat(lat: number, lon: number) {
+  const j = await getJson(`${NEA_API}/weather?api=wbgt`, neaHeaders())
+  const record = j.data.records[0]
+  type Reading = { station: { name: string }; location: { latitude: string; longitude: string }; wbgt: string; heatStress: string }
+  const nearest = (record.item.readings as Reading[])
+    .map((r) => ({
+      station: r.station.name,
+      distance_km: round1(distanceKm(lat, lon, Number(r.location.latitude), Number(r.location.longitude))),
+      wbgt_c: Number(r.wbgt),
+      heat_stress: r.heatStress,
+    }))
+    .sort((a, b) => a.distance_km - b.distance_km)[0]
+  return { time: record.datetime, nearest }
+}
+
+async function getSingaporeConditions({ latitude, longitude }: { latitude: number; longitude: number }) {
+  if (latitude < 1.1 || latitude > 1.5 || longitude < 103.55 || longitude > 104.15) {
+    return { error: 'That point is outside Singapore. Use get_weather_forecast and get_air_quality instead.' }
+  }
+  const [two_hour_forecast, rain_gauges, air_quality, heat_stress] = await Promise.all([
+    settle(neaTwoHour(latitude, longitude)),
+    settle(neaRainfall(latitude, longitude)),
+    settle(neaAir(latitude, longitude)),
+    settle(neaHeat(latitude, longitude)),
+  ])
+  return { source: 'NEA via data.gov.sg', two_hour_forecast, rain_gauges, air_quality, heat_stress }
+}
+
+// Validates a tool's input against the fields its schema requires, so a
+// malformed call returns an error result instead of hitting an API with NaN.
+function num(input: Record<string, unknown>, key: string) {
+  const v = input[key]
+  if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`"${key}" must be a number`)
+  return v
+}
+
+async function runTool(name: string, input: Record<string, unknown>): Promise<unknown> {
+  switch (name) {
+    case 'search_place': {
+      if (typeof input.query !== 'string' || !input.query.trim()) throw new Error('"query" must be a non-empty string')
+      return searchPlace({ query: input.query })
+    }
+    case 'get_weather_forecast':
+      return getWeatherForecast({ latitude: num(input, 'latitude'), longitude: num(input, 'longitude'), hours: num(input, 'hours') })
+    case 'get_air_quality':
+      return getAirQuality({ latitude: num(input, 'latitude'), longitude: num(input, 'longitude') })
+    case 'get_singapore_conditions':
+      return getSingaporeConditions({ latitude: num(input, 'latitude'), longitude: num(input, 'longitude') })
+    default:
+      throw new Error(`Unknown tool ${name}`)
+  }
+}
+
+// ---------- Request handling ----------
+
+type CompanionRequest = {
+  history: ChatMessage[]
+  question: string
+  context?: { time?: string; timezone?: string; location?: { latitude: number; longitude: number; accuracy_m?: number } }
+}
+
+// What the browser receives, one JSON object per line.
+export type CompanionEvent =
+  | { type: 'status'; text: string }
+  | { type: 'text'; delta: string }
+  | { type: 'turn'; messages: ChatMessage[] }
+  | { type: 'error'; message: string }
+
+function contextBlock(ctx: CompanionRequest['context']) {
+  const lines = [`Current time: ${ctx?.time ?? new Date().toISOString()}${ctx?.timezone ? ` (${ctx.timezone})` : ''}`]
+  const loc = ctx?.location
+  if (loc && Number.isFinite(loc.latitude) && Number.isFinite(loc.longitude)) {
+    lines.push(
+      `Device location: ${loc.latitude.toFixed(4)}, ${loc.longitude.toFixed(4)}` +
+        (loc.accuracy_m ? ` (±${Math.round(loc.accuracy_m)} m)` : ''),
+    )
+  } else {
+    lines.push('Device location: not shared')
+  }
+  return `<context>\n${lines.join('\n')}\n</context>`
+}
+
+// The browser stores the conversation and sends it back, so only let through
+// the message shapes this function itself produces. In particular a client
+// can't slip in its own system message.
+function cleanHistory(history: unknown): ChatMessage[] | null {
+  if (!Array.isArray(history)) return null
+  const out: ChatMessage[] = []
+  for (const m of history) {
+    if (!m || typeof m !== 'object') return null
+    const msg = m as Record<string, unknown>
+    if (msg.role === 'user' && typeof msg.content === 'string') {
+      out.push({ role: 'user', content: msg.content })
+    } else if (msg.role === 'assistant' && (typeof msg.content === 'string' || msg.content === null)) {
+      out.push(
+        Array.isArray(msg.tool_calls)
+          ? { role: 'assistant', content: msg.content, tool_calls: msg.tool_calls as ToolCall[] }
+          : { role: 'assistant', content: msg.content },
+      )
+    } else if (msg.role === 'tool' && typeof msg.tool_call_id === 'string' && typeof msg.content === 'string') {
+      out.push({ role: 'tool', tool_call_id: msg.tool_call_id, content: msg.content })
+    } else {
+      return null
+    }
+  }
+  return out
+}
+
+class GroqError extends Error {
+  status: number
+  code?: string
+  retryAfterMs?: number
+  constructor(status: number, message: string, code?: string, retryAfterMs?: number) {
+    super(message)
+    this.status = status
+    this.code = code
+    this.retryAfterMs = retryAfterMs
+  }
+}
+
+// Groq's free tier allows 8,000 tokens a minute, and one question can use
+// about that much across its lookups, so a short wait for the window to roll
+// over is normal rather than a failure.
+const MAX_RATE_LIMIT_WAIT_MS = 20_000
+
+type GroqChoice = { finish_reason: string; message: { content: string | null; tool_calls?: ToolCall[] } }
+
+async function groqChat(messages: ChatMessage[], signal: AbortSignal): Promise<GroqChoice> {
+  const res = await fetch(GROQ_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: JSON.stringify({
+      model: process.env.GROQ_MODEL || DEFAULT_MODEL,
+      messages,
+      tools: TOOLS,
+      tool_choice: 'auto',
+      temperature: 0.3,
+      max_completion_tokens: 2048,
+    }),
+    signal,
+  })
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const json: any = await res.json().catch(() => null)
+  if (!res.ok) {
+    const retryAfter = Number(res.headers.get('retry-after'))
+    throw new GroqError(
+      res.status,
+      json?.error?.message ?? `Groq responded ${res.status}`,
+      json?.error?.code,
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined,
+    )
+  }
+  return json.choices[0]
+}
+
+function badRequest(message: string, status = 400) {
+  return new Response(JSON.stringify({ error: message }), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+export default async function handler(req: Request): Promise<Response> {
+  if (req.method !== 'POST') return badRequest('Use POST', 405)
+  if (!process.env.GROQ_API_KEY) return badRequest('The companion is not configured (missing GROQ_API_KEY).', 503)
+
+  const raw = await req.text()
+  if (raw.length > MAX_HISTORY_BYTES) return badRequest('This conversation is too long. Start a new chat.', 413)
+  let body: CompanionRequest
+  try {
+    body = JSON.parse(raw)
+  } catch {
+    return badRequest('Invalid JSON')
+  }
+  const question = typeof body.question === 'string' ? body.question.trim() : ''
+  if (!question || question.length > MAX_QUESTION_CHARS) return badRequest('Ask a question (up to 2,000 characters).')
+  const history = cleanHistory(body.history)
+  if (!history) return badRequest('"history" is malformed. Start a new chat.')
+
+  // Everything this request adds to the conversation, sent back at the end
+  // for the browser to replay next turn.
+  const appended: ChatMessage[] = [{ role: 'user', content: `${contextBlock(body.context)}\n\n${question}` }]
+  const started = Date.now()
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const encoder = new TextEncoder()
+      const send = (event: CompanionEvent) => controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'))
+
+      try {
+        let finished = false
+        let retriedToolCall = false
+        for (let round = 0; round < MAX_TOOL_ROUNDS && !finished; round++) {
+          if (Date.now() - started > DEADLINE_MS) {
+            send({ type: 'error', message: 'That took too long to look up. Try asking again, maybe more specifically.' })
+            return
+          }
+          let choice: GroqChoice
+          try {
+            choice = await groqChat([{ role: 'system', content: SYSTEM_PROMPT }, ...history, ...appended], req.signal)
+          } catch (e) {
+            // Open models occasionally write a malformed tool call, which
+            // Groq rejects; one retry almost always goes through.
+            if (e instanceof GroqError && e.code === 'tool_use_failed' && !retriedToolCall) {
+              retriedToolCall = true
+              round--
+              continue
+            }
+            const wait = e instanceof GroqError && e.status === 429 ? e.retryAfterMs : undefined
+            if (wait && wait <= MAX_RATE_LIMIT_WAIT_MS && Date.now() - started + wait < DEADLINE_MS) {
+              send({ type: 'status', text: `Free AI quota is busy, waiting ${Math.ceil(wait / 1000)}s` })
+              await new Promise((r) => setTimeout(r, wait))
+              round--
+              continue
+            }
+            throw e
+          }
+          const { content, tool_calls } = choice.message
+          const toolCalls = tool_calls ?? []
+          appended.push(toolCalls.length ? { role: 'assistant', content, tool_calls: toolCalls } : { role: 'assistant', content })
+          if (content) send({ type: 'text', delta: content })
+          if (toolCalls.length === 0) {
+            finished = true
+            break
+          }
+
+          const results = await Promise.all(
+            toolCalls.map(async (call): Promise<ChatMessage> => {
+              let output: string
+              try {
+                const input = JSON.parse(call.function.arguments || '{}') as Record<string, unknown>
+                send({ type: 'status', text: toolStatus(call.function.name, input) })
+                output = JSON.stringify(await runTool(call.function.name, input))
+              } catch (e) {
+                output = `Failed: ${e instanceof Error ? e.message : 'unknown error'}`
+              }
+              return { role: 'tool', tool_call_id: call.id, content: output }
+            }),
+          )
+          appended.push(...results)
+        }
+        if (finished) {
+          send({ type: 'turn', messages: appended })
+        } else {
+          send({ type: 'error', message: "I couldn't finish looking that up. Try asking again." })
+        }
+      } catch (e) {
+        if (!req.signal.aborted) {
+          console.error('companion error', e)
+          const message =
+            e instanceof GroqError && e.status === 429
+              ? "The free AI quota is used up for now. Try again in a minute (or tomorrow if it's the daily limit)."
+              : e instanceof GroqError && e.status >= 500
+                ? 'The AI service is having trouble. Try again shortly.'
+                : 'Something went wrong. Try again.'
+          send({ type: 'error', message })
+        }
+      } finally {
+        controller.close()
+      }
+    },
+  })
+
+  return new Response(stream, {
+    headers: { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store' },
+  })
+}
+
+export const config = { path: '/api/companion' }

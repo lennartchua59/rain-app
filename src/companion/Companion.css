@@ -1,0 +1,390 @@
+/* Weather companion — a launcher chip in the top-left corner (the source
+   toggle owns the top-right) and a bottom sheet that slides up over the map.
+   Reuses the glass tokens from RadarMap.css. */
+
+.cmp-launcher {
+  position: fixed;
+  top: calc(14px + env(safe-area-inset-top));
+  left: calc(14px + env(safe-area-inset-left));
+  /* Same layer as the source tray: above the top scrim (690). */
+  z-index: 700;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 0 14px 0 12px;
+  border: none;
+  border-radius: 999px;
+  background: var(--glass-tint), var(--bg-panel);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  color: var(--accent);
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.cmp-launcher span {
+  color: var(--text);
+}
+
+.cmp-launcher:active {
+  background: var(--accent-soft);
+}
+
+.cmp-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+.cmp-scrim.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.cmp-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  height: min(78dvh, 720px);
+  max-width: 640px;
+  margin: 0 auto;
+  padding-bottom: env(safe-area-inset-bottom);
+  /* Opaque enough to read long text over a busy radar map. */
+  background: rgba(10, 13, 18, 0.94);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  box-shadow: 0 -18px 50px rgba(0, 0, 0, 0.55);
+  color: var(--text);
+  font-family: var(--font-display);
+  transform: translateY(105%);
+  visibility: hidden;
+  transition:
+    transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+    visibility 0s linear 0.34s;
+}
+
+.cmp-sheet.open {
+  transform: translateY(0);
+  visibility: visible;
+  transition:
+    transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+    visibility 0s;
+}
+
+/* Home-screen launches have no safe-area inset (see index.html), so clear
+   the home indicator explicitly, as the control island does. */
+@media (display-mode: standalone), (display-mode: fullscreen) {
+  .cmp-sheet {
+    padding-bottom: 20px;
+  }
+}
+
+.cmp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 10px 8px 18px;
+}
+
+.cmp-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.cmp-title span {
+  color: var(--text);
+}
+
+.cmp-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.cmp-text-btn,
+.cmp-icon-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  border-radius: 999px;
+}
+
+.cmp-text-btn {
+  padding: 8px 12px;
+}
+
+.cmp-icon-btn {
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cmp-text-btn:active,
+.cmp-icon-btn:active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.cmp-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.cmp-empty-lead {
+  margin: 4px 2px 14px;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.cmp-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cmp-suggestion {
+  text-align: left;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 14px;
+  line-height: 1.4;
+  padding: 11px 14px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.cmp-suggestion:active {
+  background: var(--accent-soft);
+}
+
+.cmp-msg {
+  font-size: 15px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.cmp-msg.user {
+  align-self: flex-end;
+  max-width: 85%;
+  background: var(--accent-soft);
+  color: var(--text);
+  padding: 9px 13px;
+  border-radius: 16px 16px 4px 16px;
+  white-space: pre-wrap;
+}
+
+.cmp-msg.assistant {
+  align-self: stretch;
+}
+
+.cmp-msg.assistant p {
+  margin: 0 0 8px;
+}
+
+.cmp-msg.assistant ul {
+  margin: 0 0 10px;
+  padding-left: 18px;
+}
+
+.cmp-msg.assistant li {
+  margin-bottom: 4px;
+}
+
+.cmp-msg.assistant li::marker {
+  color: var(--text-faint);
+}
+
+.cmp-msg.assistant strong {
+  font-weight: 800;
+}
+
+.cmp-verdict {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
+  padding: 5px 12px 5px 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.2px;
+  color: #05141c;
+  background: var(--verdict);
+}
+
+.cmp-verdict::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(5, 20, 28, 0.7);
+}
+
+/* Same greens/ambers/reds as the NEA air-quality bands on the map. */
+.cmp-verdict.go {
+  --verdict: #3ddc84;
+}
+.cmp-verdict.care {
+  --verdict: #ffb454;
+}
+.cmp-verdict.hold {
+  --verdict: #ff8a4d;
+}
+.cmp-verdict.no {
+  --verdict: #ff4d5e;
+}
+
+.cmp-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.cmp-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.cmp-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: cmp-dot 1.2s ease-in-out infinite;
+}
+
+.cmp-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.cmp-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes cmp-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+.cmp-error {
+  margin-top: 4px;
+  color: var(--accent-red);
+  font-size: 13px;
+}
+
+.cmp-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin: 0 12px;
+  padding: 6px 6px 6px 14px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 22px;
+}
+
+.cmp-input {
+  flex: 1;
+  min-width: 0;
+  max-height: 120px;
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-display);
+  /* 16px keeps iOS from zooming the page when the field is focused. */
+  font-size: 16px;
+  line-height: 1.4;
+  padding: 7px 0;
+  field-sizing: content;
+}
+
+.cmp-input::placeholder {
+  color: var(--text-faint);
+}
+
+.cmp-send {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #05141c;
+  cursor: pointer;
+}
+
+.cmp-send:disabled {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-faint);
+  cursor: default;
+}
+
+.cmp-location {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 8px 16px 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.cmp-location input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cmp-sheet,
+  .cmp-sheet.open,
+  .cmp-scrim {
+    transition: none;
+  }
+  .cmp-dots i {
+    animation: none;
+    opacity: 0.7;
+  }
+}
