@@ -1249,10 +1249,18 @@ export default function RadarMap() {
   const [refreshKey, setRefreshKey] = useState(0)
   const [refreshing, setRefreshing] = useState(false)
 
+  // Brief confirmation after a manual refresh: "Refreshing…" then what was
+  // updated and when, so a tap never looks like it did nothing.
+  const [refreshedAt, setRefreshedAt] = useState<number | null>(null)
+  const toastTimerRef = useRef<number | null>(null)
+
   const handleRefresh = useCallback(() => {
     setRefreshing(true)
+    setRefreshedAt(Date.now())
     setRefreshKey((k) => k + 1)
-    window.setTimeout(() => setRefreshing(false), 900)
+    window.setTimeout(() => setRefreshing(false), 1200)
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = window.setTimeout(() => setRefreshedAt(null), 4500)
   }, [])
 
   // Actually probes for the latest MSS frame that exists (instead of a fixed
@@ -1602,6 +1610,22 @@ export default function RadarMap() {
             Open-Meteo
           </a>
         </div>
+
+        {refreshedAt !== null && (
+          <div className={`refresh-toast${airMetric ? ' below' : ''}`} role="status">
+            {refreshing ? (
+              'Refreshing…'
+            ) : (
+              <>
+                Updated {formatTime(refreshedAt)}
+                <span className="refresh-toast-dim"> · radar {formatTime(nowAnchor)}</span>
+                {airMetric && airStatus.state === 'error' && (
+                  <span className="refresh-toast-dim"> · air quality failed</span>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
         {airMetric && (
           <div className="air-banner" role="status">
