@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import './Companion.css'
+import { MAX_QUESTION_CHARS, MAX_USER_TURNS, checkQuestion } from './guard'
 
 // The weather companion: a chat sheet over the map where you describe what
 // you want to do outside, and the AI checks live forecasts, NEA data and air
@@ -153,6 +154,8 @@ export default function Companion() {
   const [open, setOpen] = useState(false)
   const [items, setItems] = useState<Item[]>([])
   const [input, setInput] = useState('')
+  // Why the last attempted question wasn't sent; cleared on the next edit.
+  const [inputError, setInputError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [useLocation, setUseLocation] = useState(true)
   // The conversation exactly as the server returned it (including tool calls
@@ -185,6 +188,19 @@ export default function Companion() {
     async (question: string) => {
       const q = question.trim()
       if (!q || busy) return
+      // Checked here too so a refused question costs no request and stays in
+      // the box to fix; the server applies the same rules regardless.
+      const refusal =
+        checkQuestion(q) ??
+        (items.filter((it) => it.role === 'user').length >= MAX_USER_TURNS
+          ? 'This chat has reached its limit. Start a new chat to keep going.'
+          : null)
+      if (refusal) {
+        setInput(q)
+        setInputError(refusal)
+        return
+      }
+      setInputError(null)
       setInput('')
       setBusy(true)
       const userId = nextId.current++
@@ -269,13 +285,14 @@ export default function Companion() {
         setBusy(false)
       }
     },
-    [busy, useLocation, updateItem],
+    [busy, items, useLocation, updateItem],
   )
 
   const newChat = useCallback(() => {
     abortRef.current?.abort()
     historyRef.current = []
     setItems([])
+    setInputError(null)
     inputRef.current?.focus()
   }, [])
 
@@ -358,9 +375,14 @@ export default function Companion() {
             className="cmp-input"
             rows={1}
             value={input}
-            maxLength={2000}
+            maxLength={MAX_QUESTION_CHARS}
             placeholder="e.g. 2h cycle at Punggol from 4pm?"
-            onChange={(e) => setInput(e.target.value)}
+            aria-invalid={inputError ? true : undefined}
+            aria-describedby={inputError ? 'cmp-input-note' : undefined}
+            onChange={(e) => {
+              setInput(e.target.value)
+              setInputError(null)
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault()
@@ -378,6 +400,17 @@ export default function Companion() {
             </button>
           )}
         </form>
+        {inputError ? (
+          <div id="cmp-input-note" className="cmp-input-note error" role="alert">
+            {inputError}
+          </div>
+        ) : (
+          input.length > MAX_QUESTION_CHARS - 100 && (
+            <div className="cmp-input-note">
+              {input.length}/{MAX_QUESTION_CHARS}
+            </div>
+          )
+        )}
         <label className="cmp-location">
           <input type="checkbox" checked={useLocation} onChange={(e) => setUseLocation(e.target.checked)} />
           Share my location, for questions about "here" or "near me"

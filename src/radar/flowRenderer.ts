@@ -65,9 +65,8 @@ vec2 rainSmooth(sampler2D s, vec2 p, float lod) {
           rainSumLod(s, p + vec2(o.x, -o.y), lod) + rainSumLod(s, p + vec2(-o.x, o.y), lod)) / 6.0;
 }
 
-// (level, coverage) at a point.
-vec2 rain(sampler2D s, vec2 p) {
-  vec2 t = rainSmooth(s, p, 0.0);
+// (level, coverage) from a premultiplied sum.
+vec2 unpremultiply(vec2 t) {
   return t.y > 0.002 ? vec2(t.x / t.y, t.y) : vec2(0.0);
 }
 
@@ -89,7 +88,11 @@ void main() {
       pa -= flowAt(pa) * (uT * 0.25);
       pb += flowAt(pb) * ((1.0 - uT) * 0.25);
     }
-    color = mix(colorize(rain(uA, pa)), colorize(rain(uB, pb)), uT);
+    // Blend the two scans as rain (premultiplied level and coverage), then
+    // colour once. Mixing two coloured images instead leaves a half-faded
+    // copy of each wherever the motion isn't perfect, so cells pulse and
+    // ghost mid-way between scans; blending rain grows and shrinks them.
+    color = colorize(unpremultiply(mix(rainSmooth(uA, pa, 0.0), rainSmooth(uB, pb, 0.0), uT)));
   } else {
     vec2 p = vUv;
     for (int i = 0; i < 6; i++) p -= flowAt(p) * (uT / 6.0);
@@ -106,7 +109,7 @@ void main() {
     vec2 sum = (rainSmooth(uA, p, lod) * 4.0 +
                 rainSumLod(uA, p + d, lod) + rainSumLod(uA, p - d, lod) +
                 rainSumLod(uA, p + vec2(d.x, -d.y), lod) + rainSumLod(uA, p + vec2(-d.x, d.y), lod)) / 8.0;
-    vec2 r = sum.y > 0.002 ? vec2(sum.x / sum.y, sum.y) : vec2(0.0);
+    vec2 r = unpremultiply(sum);
     if (r.y > 0.0) r.x += texture(uTrend, p).r * uTrendGain;
     color = colorize(r);
   }

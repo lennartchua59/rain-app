@@ -27,9 +27,16 @@ function companionDevApi(): Plugin {
           for await (const chunk of req) chunks.push(chunk as Buffer)
           const abort = new AbortController()
           res.on('close', () => abort.abort())
-          const request = new Request(`http://localhost${req.originalUrl ?? '/api/companion'}`, {
+          // Host, Origin and the client IP as Netlify would pass them, for the
+          // function's same-origin check and rate limits.
+          const headers: Record<string, string> = {
+            'Content-Type': req.headers['content-type'] ?? 'application/json',
+            'x-nf-client-connection-ip': req.socket.remoteAddress ?? 'unknown',
+          }
+          if (req.headers.origin) headers.Origin = req.headers.origin
+          const request = new Request(`http://${req.headers.host ?? 'localhost'}${req.originalUrl ?? '/api/companion'}`, {
             method: req.method,
-            headers: { 'Content-Type': req.headers['content-type'] ?? 'application/json' },
+            headers,
             body: req.method === 'POST' ? Buffer.concat(chunks) : undefined,
             signal: abort.signal,
           })

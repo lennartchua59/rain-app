@@ -363,6 +363,17 @@
   cursor: default;
 }
 
+/* Why the typed question can't be sent, or how close it is to the limit. */
+.cmp-input-note {
+  margin: 6px 18px 0;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.cmp-input-note.error {
+  color: var(--accent-red);
+}
+
 .cmp-location {
   display: flex;
   align-items: center;

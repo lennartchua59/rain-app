@@ -1174,6 +1174,7 @@ const LIVE_SAFETY_BUFFER_MINUTES = 5
 // Playback speed for the continuous glide, so a full sweep of the timeline
 // takes about 25s.
 const PLAYBACK_MIN_PER_SEC = (PAST_MINUTES + FUTURE_MINUTES) / 25
+const PLAYBACK_END_HOLD_MS = 1200
 
 export default function RadarMap() {
   const [nowAnchor, setNowAnchor] = useState(() =>
@@ -1402,14 +1403,26 @@ export default function RadarMap() {
     if (!playing) return
     let raf: number
     let last: number | null = null
+    // While set, playback rests on the final forecast frame until this time,
+    // so the end of the loop can actually be seen before it restarts.
+    let holdUntil: number | null = null
     const tick = (now: number) => {
       if (last === null) last = now
       const dtSeconds = (now - last) / 1000
       last = now
-      setOffsetMinutes((m) => {
-        const next = m + PLAYBACK_MIN_PER_SEC * playbackRate * dtSeconds
-        return next > FUTURE_MINUTES ? -PAST_MINUTES : next
-      })
+      if (holdUntil !== null) {
+        if (now >= holdUntil) {
+          holdUntil = null
+          setOffsetMinutes(-PAST_MINUTES)
+        }
+      } else {
+        setOffsetMinutes((m) => {
+          const next = m + PLAYBACK_MIN_PER_SEC * playbackRate * dtSeconds
+          if (next < FUTURE_MINUTES) return next
+          holdUntil = now + PLAYBACK_END_HOLD_MS
+          return FUTURE_MINUTES
+        })
+      }
       raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
