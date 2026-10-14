@@ -1548,6 +1548,13 @@ export default function RadarMap() {
           <AirQualityLayer metric={airMetric} refreshKey={refreshKey} />
           <MapResizeHandler />
           <div className="map-tool-stack">
+            <button
+              className={`tool-btn${refreshing ? ' spinning' : ''}`}
+              onClick={handleRefresh}
+              aria-label="Refresh radar, wind and air quality"
+            >
+              <IconRefresh size={18} />
+            </button>
             <MyLocationControl />
             <button
               className={`tool-btn${windVisible ? ' active' : ''}`}

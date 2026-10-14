@@ -888,3 +888,7 @@
   border-radius: 999px;
   padding: 1px 5px;
 }
+
+.tool-btn.spinning svg {
+  animation: refresh-spin 0.9s linear;
+}
