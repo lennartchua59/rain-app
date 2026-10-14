@@ -18,6 +18,7 @@ import {
   type SteeringWind,
 } from './radar/FlowRadarLayer'
 import { MSS_PALETTE, RAINVIEWER_PALETTE, legendStops } from './radar/palette'
+import { clearVerification, summarize, type LeadSummary } from './radar/verify'
 import {
   MSS_FLOW_CONFIG,
   MSS_NORTH_EAST,
@@ -1156,6 +1157,75 @@ function AirQualityLayer({
   return null
 }
 
+// Running scorecard for the forecast, built from the checks radar/verify.ts
+// saves in this browser. "Match" is the critical success index: of all the
+// places where either the forecast or reality had rain, the share where both did.
+function AccuracyPanel({ onClose }: { onClose: () => void }) {
+  const [version, setVersion] = useState(0)
+  const data = useMemo(
+    () => ({ mss: summarize('mss'), rainviewer: summarize('rainviewer'), version }),
+    [version],
+  )
+  const pct = (x: number) => `${Math.round(x * 100)}%`
+  const section = (title: string, rows: LeadSummary[]) => (
+    <div className="accuracy-section">
+      <div className="accuracy-title">{title}</div>
+      <div className="accuracy-row accuracy-head">
+        <span>Ahead</span>
+        <span>Match</span>
+        <span>No-motion</span>
+        <span>Caught</span>
+        <span>Checks</span>
+      </div>
+      {rows.map((r) => (
+        <div className="accuracy-row" key={r.lead}>
+          <span>+{r.lead}m</span>
+          {r.cases < 5 ? (
+            <span className="accuracy-wait">{r.cases === 0 ? 'No checks yet' : 'Need 5+ checks'}</span>
+          ) : (
+            <>
+              <span className={r.csi >= r.persistenceCsi ? 'accuracy-good' : 'accuracy-bad'}>{pct(r.csi)}</span>
+              <span>{pct(r.persistenceCsi)}</span>
+              <span>{pct(r.pod)}</span>
+            </>
+          )}
+          <span>{r.cases}</span>
+        </div>
+      ))}
+    </div>
+  )
+  return (
+    <div className="accuracy-backdrop" onClick={onClose}>
+      <div className="accuracy-panel" role="dialog" aria-label="Forecast accuracy" onClick={(e) => e.stopPropagation()}>
+        <div className="accuracy-header">
+          <span>Forecast accuracy</span>
+          <button className="accuracy-close" onClick={onClose} aria-label="Close">
+            ✕
+          </button>
+        </div>
+        {section('SG radar', data.mss)}
+        {section('Global radar', data.rainviewer)}
+        <p className="accuracy-help">
+          Each forecast is checked against the real radar once that time arrives. <b>Match</b> is how well the
+          forecast rain lined up with the real rain (100% is perfect). <b>No-motion</b> is the score for just
+          assuming the rain stays put, so Match should beat it. <b>Caught</b> is the share of real rain the
+          forecast saw coming. Checks only build up while the app is open on that tab, and only count when
+          there was rain around.
+        </p>
+        <button
+          className="accuracy-reset"
+          onClick={() => {
+            clearVerification()
+            setVersion((v) => v + 1)
+          }}
+        >
+          Reset scores
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // Positron rendered by MapLibre inside Leaflet's tile pane (so radar and
 // markers still stack above it). The canvas gets the .basemap-tile class,
 // whose invert + hue-rotate filter turns the light style into the app's dark
@@ -1242,6 +1312,7 @@ export default function RadarMap() {
   const [airMetric, setAirMetric] = useState<AirMetric | null>(null)
   const [airStatus, setAirStatus] = useState<AirStatus>({ state: 'loading', national: null })
   const [legendOpen, setLegendOpen] = useState(false)
+  const [accuracyOpen, setAccuracyOpen] = useState(false)
   const [mssFlow, setMssFlow] = useState<FlowStatus | null>(null)
   const [rvFlow, setRvFlow] = useState<FlowStatus | null>(null)
   // Bumping this re-runs every live-data effect below immediately, for the
@@ -1513,6 +1584,7 @@ export default function RadarMap() {
             opacity={opacity}
             visible={radarSource === 'mss'}
             onStatus={setMssFlow}
+            verifySource="mss"
           />
           <FlowRadarLayer
             enabled={radarSource === 'rainviewer'}
@@ -1526,6 +1598,7 @@ export default function RadarMap() {
             opacity={opacity}
             visible={radarSource === 'rainviewer'}
             onStatus={setRvFlow}
+            verifySource="rainviewer"
           />
           {/* Fallbacks, only shown while (or if) the motion-tracked layer
               above can't render for the selected source. */}
@@ -1745,6 +1818,9 @@ export default function RadarMap() {
             {note.confidence && (
               <span className={`radar-note-confidence ${note.confidence}`}>{note.confidence} confidence</span>
             )}
+            <button className="radar-note-accuracy" onClick={() => setAccuracyOpen(true)}>
+              Accuracy ›
+            </button>
           </div>
 
           <div className="controls-row">
@@ -1792,6 +1868,7 @@ export default function RadarMap() {
           </div>
         </div>
       </div>
+      {accuracyOpen && <AccuracyPanel onClose={() => setAccuracyOpen(false)} />}
     </div>
   )
 }

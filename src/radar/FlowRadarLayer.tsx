@@ -17,6 +17,8 @@ import {
 } from './motion'
 import { FlowRenderer } from './flowRenderer'
 
+import { recordForecast, verifyAgainst, type VerifySource } from './verify'
+
 const KM_PER_DEG = 111.32
 
 export type FlowKeyframe = { key: string; time: number }
@@ -205,6 +207,7 @@ export function FlowRadarLayer({
   opacity,
   visible,
   onStatus,
+  verifySource,
 }: {
   enabled: boolean
   frames: FlowKeyframe[]
@@ -219,6 +222,9 @@ export function FlowRadarLayer({
   opacity: number
   visible: boolean
   onStatus: (s: FlowStatus) => void
+  // When set, forecasts from this layer are saved and later scored against
+  // the real scans (see radar/verify.ts).
+  verifySource?: VerifySource
 }) {
   const map = useMap()
   const overlayRef = useRef<CanvasOverlay | null>(null)
@@ -316,11 +322,21 @@ export function FlowRadarLayer({
         }
         const levels = decodeLevels(rgba, palette)
         renderer.uploadLevels(f.key, levels, w, h)
-        decoded.set(f.key, { key: f.key, time: f.time, w, h, grid: downsampleLevels(levels, w, h, config.factor) })
+        const grid = downsampleLevels(levels, w, h, config.factor)
+        decoded.set(f.key, { key: f.key, time: f.time, w, h, grid })
         setLoadVersion((v) => v + 1)
+        if (verifySource) {
+          window.setTimeout(() => {
+            try {
+              verifyAgainst(verifySource, f.time, grid)
+            } catch {
+              // Scoring must never break the map.
+            }
+          }, 0)
+        }
       })
     }
-  }, [enabled, frames, loadFrame, palette, config.factor])
+  }, [enabled, frames, loadFrame, palette, config.factor, verifySource])
 
   // Measure motion: first the forecast motion across the baseline (which
   // also seeds every pair search), then each consecutive scan pair. Runs in
@@ -379,6 +395,22 @@ export function FlowRadarLayer({
         towardBearingDeg: ((Math.atan2(u, v) * 180) / Math.PI + 360) % 360,
       }
       scheduleDraw()
+      if (verifySource) {
+        try {
+          recordForecast({
+            src: verifySource,
+            issued: latest.time,
+            latest: latest.grid,
+            flow,
+            trend,
+            dtMinutes: dt,
+            motion: source,
+            trendTau: TREND_TAU,
+          })
+        } catch {
+          // Scoring must never break the map.
+        }
+      }
     })
 
     for (let i = 0; i + 1 < list.length; i++) {
