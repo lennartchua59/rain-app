@@ -1045,28 +1045,70 @@ function airBand(metric: AirMetric, value: number) {
   return AIR_BANDS[metric].find((b) => value <= b.max) ?? AIR_BANDS[metric][0]
 }
 
-async function fetchAirReadings(metric: AirMetric): Promise<AirReading[]> {
+// Label positions NEA uses for its five regions, as a fallback if the feed's
+// own region metadata is missing or named differently.
+const REGION_FALLBACK: Record<string, [number, number]> = {
+  west: [1.35735, 103.7],
+  east: [1.35735, 103.94],
+  central: [1.35735, 103.82],
+  south: [1.29587, 103.82],
+  north: [1.41803, 103.82],
+}
+
+type AirData = { readings: AirReading[]; national: number | null }
+
+// Reads a "region -> number" table from the reading set, whatever the exact
+// key name is (e.g. pm25_one_hourly) so a small rename upstream doesn't blank the map.
+function pickTable(readings: Record<string, unknown>, metric: AirMetric) {
+  const wanted = metric === 'psi' ? /^psi.*(24|twenty)/i : /^pm_?25.*(1|one).*h/i
+  const key = Object.keys(readings).find((k) => wanted.test(k))
+  const table = key ? readings[key] : null
+  return table && typeof table === 'object' ? (table as Record<string, number>) : null
+}
+
+async function fetchAirReadings(metric: AirMetric): Promise<AirData> {
   const res = await fetch(metric === 'psi' ? PSI_API : PM25_API, { cache: 'no-store' })
   if (!res.ok) throw new Error(`air quality ${res.status}`)
   const json = await res.json()
-  const regions: { name: string; labelLocation: { latitude: number; longitude: number } }[] =
-    json?.data?.regionMetadata ?? []
-  const items = json?.data?.items ?? []
-  const readings = items[items.length - 1]?.readings?.[metric === 'psi' ? 'psi_twenty_four_hourly' : 'pm25_one_hourly']
-  if (!readings) return []
-  const out: AirReading[] = []
-  for (const r of regions) {
-    const raw = readings[r.name]
-    if (typeof raw !== 'number' || r.name === 'national') continue
-    const value = metric === 'psi1h' ? pm25ToPsi(raw) : raw
-    out.push({ region: r.name, lat: r.labelLocation.latitude, lon: r.labelLocation.longitude, value })
+  const data = json?.data ?? {}
+  const items = data.items ?? []
+  const table = pickTable(items[items.length - 1]?.readings ?? {}, metric)
+  if (!table) throw new Error('air quality: no readings')
+  const meta: { name: string; labelLocation?: { latitude: number; longitude: number } }[] = (
+    data.regionMetadata ??
+    data.region_metadata ??
+    []
+  ).map((r: { name: string; labelLocation?: never; label_location?: never }) => ({
+    name: r.name,
+    labelLocation: r.labelLocation ?? r.label_location,
+  }))
+  const convert = (raw: number) => (metric === 'psi1h' ? pm25ToPsi(raw) : raw)
+  const readings: AirReading[] = []
+  for (const name of Object.keys(REGION_FALLBACK)) {
+    const raw = table[name]
+    if (typeof raw !== 'number') continue
+    const loc = meta.find((r) => r.name?.toLowerCase() === name)?.labelLocation
+    const [lat, lon] = loc ? [loc.latitude, loc.longitude] : REGION_FALLBACK[name]
+    readings.push({ region: name, lat, lon, value: convert(raw) })
   }
-  return out
+  if (readings.length === 0) throw new Error('air quality: no regions')
+  const national = typeof table.national === 'number' ? convert(table.national) : null
+  return { readings, national }
 }
+
+type AirStatus = { state: 'loading' | 'ok' | 'error'; national: number | null }
 
 // Regional air quality badges (west/east/central/south/north), coloured by
 // NEA band. Only fetches while a metric is selected.
-function AirQualityLayer({ metric, refreshKey }: { metric: AirMetric | null; refreshKey: number }) {
+function AirQualityLayer({
+  metric,
+  refreshKey,
+  onStatus,
+}: {
+  metric: AirMetric | null
+  refreshKey: number
+  onStatus: (s: AirStatus) => void
+}) {
   const map = useMap()
   const [data, setData] = useState<{ metric: AirMetric; readings: AirReading[] } | null>(null)
   const readings = data && data.metric === metric ? data.readings : NO_READINGS
@@ -1074,19 +1116,24 @@ function AirQualityLayer({ metric, refreshKey }: { metric: AirMetric | null; ref
   useEffect(() => {
     if (!metric) return
     let cancelled = false
+    onStatus({ state: 'loading', national: null })
     const load = () =>
       fetchAirReadings(metric)
         .then((r) => {
-          if (!cancelled) setData({ metric, readings: r })
+          if (cancelled) return
+          setData({ metric, readings: r.readings })
+          onStatus({ state: 'ok', national: r.national })
         })
-        .catch(() => {})
+        .catch(() => {
+          if (!cancelled) onStatus({ state: 'error', national: null })
+        })
     load()
     const id = window.setInterval(load, 10 * 60 * 1000)
     return () => {
       cancelled = true
       window.clearInterval(id)
     }
-  }, [metric, refreshKey])
+  }, [metric, refreshKey, onStatus])
 
   useEffect(() => {
     if (!metric) return
@@ -1193,6 +1240,7 @@ export default function RadarMap() {
   const opacity = radarSource === 'rainviewer' ? RAINVIEWER_LAYER_OPACITY : 0.92
   const [windVisible, setWindVisible] = useState(true)
   const [airMetric, setAirMetric] = useState<AirMetric | null>(null)
+  const [airStatus, setAirStatus] = useState<AirStatus>({ state: 'loading', national: null })
   const [legendOpen, setLegendOpen] = useState(false)
   const [mssFlow, setMssFlow] = useState<FlowStatus | null>(null)
   const [rvFlow, setRvFlow] = useState<FlowStatus | null>(null)
@@ -1492,7 +1540,7 @@ export default function RadarMap() {
             visible={radarSource === 'rainviewer' && !rvFlowReady}
           />
           <WindArrowLayer stations={windField?.stations ?? []} visible={windVisible} />
-          <AirQualityLayer metric={airMetric} refreshKey={refreshKey} />
+          <AirQualityLayer metric={airMetric} refreshKey={refreshKey} onStatus={setAirStatus} />
           <MapResizeHandler />
           <div className="map-tool-stack">
             <MyLocationControl />
@@ -1554,6 +1602,26 @@ export default function RadarMap() {
             Open-Meteo
           </a>
         </div>
+
+        {airMetric && (
+          <div className="air-banner" role="status">
+            <span className="air-banner-title">
+              {airMetric === 'pm25' ? 'PM2.5 (1hr)' : airMetric === 'psi' ? '24hr PSI' : '1hr PSI (est.)'}
+            </span>
+            {airStatus.state === 'loading' && <span className="air-banner-dim">Loading…</span>}
+            {airStatus.state === 'error' && <span className="air-banner-dim">Couldn’t load. Tap refresh to retry.</span>}
+            {airStatus.state === 'ok' && airStatus.national !== null && (
+              <>
+                <span className="air-banner-value" style={{ color: airBand(airMetric, airStatus.national).color }}>
+                  {Math.round(airStatus.national)}
+                </span>
+                <span className="air-banner-dim">
+                  Band {airBand(airMetric, airStatus.national).tag} · {airBand(airMetric, airStatus.national).label}
+                </span>
+              </>
+            )}
+          </div>
+        )}
 
         <div className={`source-tray${radarSource === 'rainviewer' ? ' shifted' : ''}`}>
           <span className="source-tray-thumb" />

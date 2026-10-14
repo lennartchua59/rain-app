@@ -942,3 +942,34 @@
   border-radius: 999px;
   padding: 1px 5px;
 }
+
+.air-banner {
+  position: absolute;
+  top: calc(66px + env(safe-area-inset-top));
+  right: calc(14px + env(safe-area-inset-right));
+  z-index: 700;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: calc(100% - 28px);
+  padding: 8px 14px;
+  background: var(--glass-tint), var(--bg-panel);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  border-radius: 999px;
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.air-banner-value {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.air-banner-dim {
+  color: var(--text-dim);
+  font-weight: 600;
+}
