@@ -367,11 +367,11 @@ async function stitchRainviewerFrame(host: string, path: string): Promise<HTMLCa
 // — or too loose — showing a "LIVE" frame that's really several minutes
 // stale). Starts at the real current 5-minute boundary and steps backward
 // until an image genuinely loads.
-async function probeLatestMssEpoch(maxStepsBack = 4): Promise<number | null> {
+async function probeLatestMssEpoch(bust = false, maxStepsBack = 4): Promise<number | null> {
   const candidate = floorToSgFiveMin(Date.now())
   for (let i = 0; i <= maxStepsBack; i++) {
     const epoch = candidate - i * STEP_MINUTES * 60 * 1000
-    if (await preloadImage(mssImageUrl(epoch))) return epoch
+    if (await preloadImage(`${mssImageUrl(epoch)}${bust ? `?r=${Date.now()}` : ''}`)) return epoch
   }
   return null
 }
@@ -380,7 +380,7 @@ async function probeLatestMssEpoch(maxStepsBack = 4): Promise<number | null> {
 // for the wind arrows and as a last-resort drift estimate.
 async function fetchWindField(): Promise<WindField | null> {
   try {
-    const [speedRes, dirRes] = await Promise.all([fetch(WIND_SPEED_API), fetch(WIND_DIRECTION_API)])
+    const [speedRes, dirRes] = await Promise.all([fetch(WIND_SPEED_API, { cache: 'no-store' }), fetch(WIND_DIRECTION_API, { cache: 'no-store' })])
     if (!speedRes.ok || !dirRes.ok) return null
     const speedJson = await speedRes.json()
     const dirJson = await dirRes.json()
@@ -1046,7 +1046,7 @@ function airBand(metric: AirMetric, value: number) {
 }
 
 async function fetchAirReadings(metric: AirMetric): Promise<AirReading[]> {
-  const res = await fetch(metric === 'psi' ? PSI_API : PM25_API)
+  const res = await fetch(metric === 'psi' ? PSI_API : PM25_API, { cache: 'no-store' })
   if (!res.ok) throw new Error(`air quality ${res.status}`)
   const json = await res.json()
   const regions: { name: string; labelLocation: { latitude: number; longitude: number } }[] =
@@ -1213,7 +1213,7 @@ export default function RadarMap() {
   useEffect(() => {
     let cancelled = false
     async function sync() {
-      const epoch = await probeLatestMssEpoch()
+      const epoch = await probeLatestMssEpoch(refreshKey > 0)
       if (cancelled || epoch === null) return
       setNowAnchor(epoch)
     }
@@ -1262,7 +1262,7 @@ export default function RadarMap() {
     let cancelled = false
     async function load() {
       try {
-        const res = await fetch(RAINVIEWER_API)
+        const res = await fetch(RAINVIEWER_API, { cache: 'no-store' })
         if (!res.ok) return
         const json = await res.json()
         if (!cancelled) setRainviewer({ host: json.host, past: json.radar?.past ?? [] })
@@ -1495,13 +1495,6 @@ export default function RadarMap() {
           <AirQualityLayer metric={airMetric} refreshKey={refreshKey} />
           <MapResizeHandler />
           <div className="map-tool-stack">
-            <button
-              className={`tool-btn${refreshing ? ' spinning' : ''}`}
-              onClick={handleRefresh}
-              aria-label="Refresh radar, wind and air quality"
-            >
-              <IconRefresh size={18} />
-            </button>
             <MyLocationControl />
             <button
               className={`tool-btn${windVisible ? ' active' : ''}`}
