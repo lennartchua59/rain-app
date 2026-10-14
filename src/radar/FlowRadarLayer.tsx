@@ -4,14 +4,16 @@ import L from 'leaflet'
 import { buildLut, decodeLevels, type Palette } from './palette'
 import {
   downsampleLevels,
-  estimateFlowField,
   estimateGlobalShift,
-  estimateTrend,
+  estimateFlowField,
+  measureNowcastMotion,
   scaleFlow,
   uniformFlow,
-  type AnalysisConfig,
   type Field,
   type FlowField,
+  type FlowSourceConfig,
+  type MotionSource,
+  type SteeringWind,
 } from './motion'
 import { FlowRenderer } from './flowRenderer'
 
@@ -19,22 +21,7 @@ const KM_PER_DEG = 111.32
 
 export type FlowKeyframe = { key: string; time: number }
 
-export type SteeringWind = { u: number; v: number } // km/h east / north
-
-export type FlowSourceConfig = AnalysisConfig & {
-  // Gap between the two scans the forecast motion/trend is measured across.
-  // Wider than one scan interval so slow tropical cells move measurably.
-  baselineMin: number
-  // Search radius (analysis cells) around the prior for the baseline motion.
-  searchRadius: number
-  // Search radius around the scaled baseline motion for each scan pair.
-  pairRadius: number
-  // Fraction of the image that must be raining before radar-tracked motion
-  // is trusted over the steering wind. Scattered specks don't track reliably.
-  minCoverage: number
-}
-
-export type MotionSource = 'radar' | 'steering' | 'none'
+export type { FlowSourceConfig, MotionSource, SteeringWind }
 
 export type FlowStatus = {
   ready: boolean
@@ -73,9 +60,6 @@ const BLUR_KM_PER_MIN = 0.05
 // Trend saturation, in baseline intervals: the measured growth/decay is
 // applied at most ~this many intervals' worth, since trends don't persist.
 const TREND_TAU = 1
-// Largest disagreement (km/h) between the latest and the previous baseline's
-// motion for the radar-tracked vector to be trusted over the steering wind.
-const MAX_MOTION_DISAGREEMENT_KMH = 12
 // Hard ceiling on the backing canvas so very high zoom on a big screen can't
 // allocate something enormous.
 const MAX_BACKING_PX = 2560
@@ -365,55 +349,18 @@ export function FlowRadarLayer({
       const prior = steering
         ? { dx: (steering.u * dt) / 60 / cellKmX, dy: (-steering.v * dt) / 60 / cellKmY }
         : { dx: 0, dy: 0 }
-      let flow: FlowField | null = null
-      let trend: Field | null = null
-      let source: MotionSource = 'none'
-      let gdx = 0
-      let gdy = 0
-      if (prev) {
-        const shift = estimateGlobalShift(prev.grid, latest.grid, prior.dx, prior.dy, config.searchRadius)
-        // Independent check one baseline earlier: real storm motion holds
-        // steady over a quarter hour, noise doesn't. Backtests showed
-        // scattered showers producing confident-looking but random vectors
-        // that this rejects.
-        let consistent = true
-        const prev2 = closestTo(list, prev.time - dt * 60_000, prev.time)
-        if (shift?.confident && prev2) {
-          const dt2 = (prev.time - prev2.time) / 60_000
-          const k = dt2 / dt
-          const earlier = estimateGlobalShift(prev2.grid, prev.grid, prior.dx * k, prior.dy * k, config.searchRadius)
-          if (earlier?.confident) {
-            const du = ((shift.dx / dt - earlier.dx / dt2) * cellKmX * 60)
-            const dv = ((shift.dy / dt - earlier.dy / dt2) * cellKmY * 60)
-            consistent = Math.hypot(du, dv) <= MAX_MOTION_DISAGREEMENT_KMH
-          } else if (earlier) {
-            consistent = false
-          }
-        }
-        let raining = 0
-        for (const x of latest.grid.data) if (x >= 0.5) raining++
-        const enoughRain = raining / latest.grid.data.length >= config.minCoverage
-        if (shift?.confident && consistent && (enoughRain || !steering)) {
-          gdx = shift.dx
-          gdy = shift.dy
-          source = 'radar'
-        } else if (steering) {
-          gdx = prior.dx
-          gdy = prior.dy
-          source = 'steering'
-        }
-        flow =
-          source === 'radar'
-            ? estimateFlowField(prev.grid, latest.grid, gdx, gdy, { ...config, localRadius: config.localRadius + 2 })
-            : uniformFlow(gdx, gdy)
-        trend = estimateTrend(prev.grid, latest.grid, flow, 6)
-      } else if (steering) {
-        gdx = prior.dx
-        gdy = prior.dy
-        source = 'steering'
-        flow = uniformFlow(gdx, gdy)
-      }
-      if (!flow) flow = uniformFlow(0, 0)
+      const prev2 = prev ? closestTo(list, prev.time - dt * 60_000, prev.time) : null
+      const { flow, trend, source, dx: gdx, dy: gdy } = measureNowcastMotion({
+        latest: latest.grid,
+        prev: prev?.grid ?? null,
+        prev2: prev2?.grid ?? null,
+        dt,
+        dt2: prev && prev2 ? (prev.time - prev2.time) / 60_000 : dt,
+        prior: steering ? prior : null,
+        cellKmX,
+        cellKmY,
+        config,
+      })
       renderer.uploadFlow(nowcastKey, flow)
       const trendKey = trend ? `${nowcastKey}:trend` : null
       if (trend && trendKey) renderer.uploadTrend(trendKey, trend)

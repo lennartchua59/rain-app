@@ -1,0 +1,15 @@
+# Netlify builds the site from the repo: the Vite app goes to dist/, and the
+# weather companion's server function (netlify/functions/companion.ts) is
+# deployed alongside it at /api/companion. Drag-and-drop (Netlify Drop) deploys
+# skip functions entirely, so deploy from Git or the Netlify CLI instead.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # Vite 8 needs Node 20.19+ or 22.12+.
+  NODE_VERSION = "22"
+
+[functions]
+  directory = "netlify/functions"
