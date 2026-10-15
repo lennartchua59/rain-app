@@ -406,6 +406,7 @@ export function FlowRadarLayer({
             dtMinutes: dt,
             motion: source,
             trendTau: TREND_TAU,
+            cellKm: [cellKmX, cellKmY],
           })
         } catch {
           // Scoring must never break the map.
@@ -529,6 +530,7 @@ export function FlowRadarLayer({
       gridW,
       gridH,
       blurUv: [blurKm / km.w, blurKm / km.h],
+      domainKm: [km.w, km.h],
       // Fades gently with lead time so the forecast reads as less certain
       // than observed scans without washing out.
       opacity: opacity * (1 - 0.25 * Math.min(1, leadMin / 120)),

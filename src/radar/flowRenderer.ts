@@ -40,6 +40,8 @@ uniform float uTrendGain; // mode 1: how many intervals of trend to apply
 uniform vec2 uBlur;       // mode 1: lead-time smoothing radius, in uv
 uniform float uLutSize;
 uniform float uOpacity;
+uniform vec2 uDomainKm;   // size of the radar image, in km
+uniform float uInflowKm;  // mode 1: how far upwind of the image edge inflow fades out
 
 vec2 flowAt(vec2 p) { return texture(uFlow, p).rg * uCellUv; }
 
@@ -56,6 +58,11 @@ vec2 rainSumLod(sampler2D s, vec2 p, float lod) {
   return vec2(t.r * 255.0, t.g);
 }
 
+// Same, but holding the image's edge value outside it (forecast inflow).
+vec2 rainEdgeLod(sampler2D s, vec2 p, float lod) {
+  return rainSumLod(s, clamp(p, 0.0, 1.0), lod);
+}
+
 // Plain bilinear turns each lone radar pixel into a diamond once magnified;
 // a small 5-tap tent around the point rounds contours off instead.
 vec2 rainSmooth(sampler2D s, vec2 p, float lod) {
@@ -63,6 +70,13 @@ vec2 rainSmooth(sampler2D s, vec2 p, float lod) {
   return (rainSumLod(s, p, lod) * 2.0 +
           rainSumLod(s, p + o, lod) + rainSumLod(s, p - o, lod) +
           rainSumLod(s, p + vec2(o.x, -o.y), lod) + rainSumLod(s, p + vec2(-o.x, o.y), lod)) / 6.0;
+}
+
+vec2 rainSmoothEdge(sampler2D s, vec2 p, float lod) {
+  vec2 o = 0.4 * exp2(lod) / vec2(textureSize(s, 0));
+  return (rainEdgeLod(s, p, lod) * 2.0 +
+          rainEdgeLod(s, p + o, lod) + rainEdgeLod(s, p - o, lod) +
+          rainEdgeLod(s, p + vec2(o.x, -o.y), lod) + rainEdgeLod(s, p + vec2(-o.x, o.y), lod)) / 6.0;
 }
 
 // (level, coverage) from a premultiplied sum.
@@ -96,20 +110,25 @@ void main() {
   } else {
     vec2 p = vUv;
     for (int i = 0; i < 6; i++) p -= flowAt(p) * (uT / 6.0);
-    // Rain arriving from beyond the radar image is unknown, not absent.
-    // Keeping what's there now (persistence) instead of drawing it dry
-    // scored clearly better in backtests on the small SG image, and made no
-    // difference on the wide regional one.
-    if (p.x < 0.0 || p.y < 0.0 || p.x > 1.0 || p.y > 1.0) p = vUv;
+    // Rain arriving from beyond the radar image is unknown, not absent, so
+    // whatever sits on the upwind edge now keeps flowing in, fading out the
+    // further upwind the trace had to go. (Falling back to the rain at this
+    // very pixel instead froze a copy of every storm touching the edge in
+    // place while the real one moved off: a stationary duplicate.)
+    vec2 edge = clamp(p, 0.0, 1.0);
+    float inflow = 1.0 - smoothstep(0.0, uInflowKm, length((p - edge) * uDomainKm));
+    p = edge;
     // Lead-time smoothing from the mip chain (a true low-pass, so small
     // cells soften rather than ghosting into sparse-tap stars), with four
     // half-radius taps to round off the mip level's box shape.
     float lod = max(0.0, log2(max(uBlur.x * float(textureSize(uA, 0).x), 1e-3)));
     vec2 d = uBlur * 0.5;
-    vec2 sum = (rainSmooth(uA, p, lod) * 4.0 +
-                rainSumLod(uA, p + d, lod) + rainSumLod(uA, p - d, lod) +
-                rainSumLod(uA, p + vec2(d.x, -d.y), lod) + rainSumLod(uA, p + vec2(-d.x, d.y), lod)) / 8.0;
-    vec2 r = unpremultiply(sum);
+    vec2 sum = (rainSmoothEdge(uA, p, lod) * 4.0 +
+                rainEdgeLod(uA, p + d, lod) + rainEdgeLod(uA, p - d, lod) +
+                rainEdgeLod(uA, p + vec2(d.x, -d.y), lod) + rainEdgeLod(uA, p + vec2(-d.x, d.y), lod)) / 8.0;
+    // Fading coverage (not level) shrinks the inflow back rather than
+    // washing it through lighter colours.
+    vec2 r = unpremultiply(sum * inflow);
     if (r.y > 0.0) r.x += texture(uTrend, p).r * uTrendGain;
     color = colorize(r);
   }
@@ -130,7 +149,14 @@ export type DrawParams = {
   blurUv?: [number, number]
   opacity: number
   view: [number, number, number, number]
+  // Radar image size in km, for the forecast's inflow fade.
+  domainKm?: [number, number]
 }
+
+// Forecast inflow: rain on the upwind edge of the radar image keeps arriving,
+// fading out once the trace is this far beyond the edge (shared with the
+// scorekeeping copy in verify.ts).
+export const INFLOW_FADE_KM = 25
 
 export class FlowRenderer {
   private gl: WebGL2RenderingContext
@@ -184,6 +210,8 @@ export class FlowRenderer {
       'uBlur',
       'uLutSize',
       'uOpacity',
+      'uDomainKm',
+      'uInflowKm',
     ]) {
       this.uniforms[name] = gl.getUniformLocation(program, name)
     }
@@ -317,6 +345,8 @@ export class FlowRenderer {
     gl.uniform2f(u.uBlur, p.blurUv?.[0] ?? 0, p.blurUv?.[1] ?? 0)
     gl.uniform1f(u.uLutSize, this.lutSize)
     gl.uniform1f(u.uOpacity, p.opacity)
+    gl.uniform2f(u.uDomainKm, p.domainKm?.[0] ?? 1, p.domainKm?.[1] ?? 1)
+    gl.uniform1f(u.uInflowKm, INFLOW_FADE_KM)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
     return true
   }

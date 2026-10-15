@@ -4,6 +4,7 @@
 // localStorage, so it builds up on whichever device the app is opened on.
 
 import { sampleField, sampleFlow, type Field, type FlowField } from './motion'
+import { INFLOW_FADE_KM } from './flowRenderer'
 
 export const VERIFY_LEADS = [15, 30, 60] as const
 export type VerifySource = 'mss' | 'rainviewer'
@@ -86,10 +87,18 @@ function rainMask(f: Field): Uint8Array {
 }
 
 // CPU copy of the map's forecast step (flowRenderer's extrapolate mode):
-// trace each cell back along the motion, keep what's there now where the
-// trace leaves the image, then add the growth/decay trend. The on-screen
-// lead-time softening is left out, since it only blurs edges.
-function forecastMask(latest: Field, flow: FlowField, trend: Field | null, steps: number, trendGain: number) {
+// trace each cell back along the motion, take the image's edge value (fading
+// with distance) where the trace leaves the image, then add the growth/decay
+// trend. The on-screen lead-time softening is left out, since it only blurs
+// edges.
+function forecastMask(
+  latest: Field,
+  flow: FlowField,
+  trend: Field | null,
+  steps: number,
+  trendGain: number,
+  cellKm: [number, number],
+) {
   const { w, h } = latest
   const m = new Uint8Array(w * h)
   for (let y = 0; y < h; y++) {
@@ -101,10 +110,12 @@ function forecastMask(latest: Field, flow: FlowField, trend: Field | null, steps
         px -= (f.u * steps) / 6
         py -= (f.v * steps) / 6
       }
-      if (px < 0 || py < 0 || px > w - 1 || py > h - 1) {
-        px = x
-        py = y
-      }
+      const ex = Math.min(Math.max(px, 0), w - 1)
+      const ey = Math.min(Math.max(py, 0), h - 1)
+      // Past the midpoint of the GPU's inflow fade, the edge rain is drawn dry.
+      if (Math.hypot((px - ex) * cellKm[0], (py - ey) * cellKm[1]) > INFLOW_FADE_KM / 2) continue
+      px = ex
+      py = ey
       let level = sampleField(latest, px, py) ?? 0
       if (level > 0 && trend) level += (sampleField(trend, px, py) ?? 0) * trendGain
       m[y * w + x] = level >= RAIN_LEVEL ? 1 : 0
@@ -122,6 +133,7 @@ export function recordForecast({
   dtMinutes,
   motion,
   trendTau,
+  cellKm,
 }: {
   src: VerifySource
   issued: number
@@ -131,6 +143,7 @@ export function recordForecast({
   dtMinutes: number
   motion: string
   trendTau: number
+  cellKm: [number, number]
 }) {
   const pending = load<Pending[]>(PENDING_KEY, [])
   if (pending.some((p) => p.src === src && p.issued === issued)) return
@@ -138,7 +151,7 @@ export function recordForecast({
   for (const lead of VERIFY_LEADS) {
     const steps = lead / dtMinutes
     const gain = trendTau * (1 - Math.exp(-steps / trendTau))
-    fc[lead] = packMask(forecastMask(latest, flow, trend, steps, gain))
+    fc[lead] = packMask(forecastMask(latest, flow, trend, steps, gain, cellKm))
   }
   pending.push({ src, issued, motion, w: latest.w, h: latest.h, latest: packMask(rainMask(latest)), fc, done: [] })
   // Anything older than the longest lead plus a margin can no longer be matched.
