@@ -63,7 +63,7 @@ export default defineConfig(({ mode }) => {
   // Server-only secrets (GROQ_API_KEY, DATA_GOV_SG_API_KEY) from
   // .env.local, exposed to the dev function but never to the browser bundle.
   const env = loadEnv(mode, process.cwd(), '')
-  for (const key of ['GROQ_API_KEY', 'GROQ_MODEL', 'DATA_GOV_SG_API_KEY']) {
+  for (const key of ['GROQ_API_KEY', 'GROQ_MODEL', 'GROQ_FALLBACK_MODELS', 'DATA_GOV_SG_API_KEY']) {
     if (env[key] && !process.env[key]) process.env[key] = env[key]
   }
   return {

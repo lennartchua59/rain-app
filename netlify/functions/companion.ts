@@ -13,6 +13,11 @@ import { MAX_USER_TURNS, OFF_TOPIC_MESSAGE, checkQuestion } from '../../src/comp
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const DEFAULT_MODEL = 'openai/gpt-oss-120b'
+// Groq's free tier meters each model separately, so when one runs dry the
+// next still has its own allowance. Override with GROQ_FALLBACK_MODELS
+// (comma-separated, empty to turn fallback off).
+const DEFAULT_FALLBACK_MODELS = ['openai/gpt-oss-20b', 'llama-3.3-70b-versatile']
+const DEFAULT_COOLDOWN_MS = 60_000
 const MAX_TOOL_ROUNDS = 6
 const MAX_PLACE_SEARCHES = 2
 // Netlify stops a streamed function at 60s; stop starting new model turns
@@ -651,8 +656,27 @@ const MAX_RATE_LIMIT_WAIT_MS = 20_000
 
 type GroqChoice = { finish_reason: string; message: { content: string | null; tool_calls?: ToolCall[] } }
 
-async function groqChat(messages: ChatMessage[], signal: AbortSignal): Promise<GroqChoice> {
-  const model = process.env.GROQ_MODEL || DEFAULT_MODEL
+function modelChain() {
+  const primary = process.env.GROQ_MODEL || DEFAULT_MODEL
+  const fallbacks =
+    process.env.GROQ_FALLBACK_MODELS === undefined
+      ? DEFAULT_FALLBACK_MODELS
+      : process.env.GROQ_FALLBACK_MODELS.split(',').map((m) => m.trim()).filter(Boolean)
+  return [primary, ...fallbacks.filter((m) => m !== primary)]
+}
+
+// When each model's allowance is expected back, so later questions skip a
+// model that just ran out instead of spending a request to find out. Per warm
+// function instance, like the limiter in lib/rateLimit.ts.
+const coolingUntil = new Map<string, number>()
+
+// The first model not cooling down, or the one that recovers soonest when all are.
+function pickModel(now = Date.now()) {
+  const chain = modelChain()
+  return chain.find((m) => (coolingUntil.get(m) ?? 0) <= now) ?? chain.reduce((a, b) => ((coolingUntil.get(b) ?? 0) < (coolingUntil.get(a) ?? 0) ? b : a))
+}
+
+async function groqChat(model: string, messages: ChatMessage[], signal: AbortSignal): Promise<GroqChoice> {
   // Reasoning tokens count against the free tier too. Picking which lookups to
   // run needs little thought; writing the verdict from the results needs more.
   const haveData = messages.some((m) => m.role === 'tool')
@@ -766,9 +790,19 @@ export default async function handler(req: Request, context?: { ip?: string }): 
             return
           }
           let choice: GroqChoice
+          const model = pickModel()
           try {
-            choice = await groqChat([{ role: 'system', content: SYSTEM_PROMPT }, ...history, ...appended], req.signal)
+            choice = await groqChat(model, [{ role: 'system', content: SYSTEM_PROMPT }, ...history, ...appended], req.signal)
           } catch (e) {
+            if (e instanceof GroqError && e.status === 429) {
+              coolingUntil.set(model, Date.now() + (e.retryAfterMs ?? DEFAULT_COOLDOWN_MS))
+              // Another model with allowance left: carry on with it right away.
+              const next = pickModel()
+              if (next !== model && (coolingUntil.get(next) ?? 0) <= Date.now()) {
+                round--
+                continue
+              }
+            }
             // Open models occasionally write a malformed tool call, which
             // Groq rejects; one retry almost always goes through.
             if (e instanceof GroqError && e.code === 'tool_use_failed' && !retriedToolCall) {
