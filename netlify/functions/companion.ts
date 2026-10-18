@@ -666,7 +666,9 @@ async function groqChat(messages: ChatMessage[], signal: AbortSignal): Promise<G
       tools: TOOLS,
       tool_choice: 'auto',
       temperature: 0.3,
-      max_completion_tokens: 2048,
+      // Groq counts the full allowance against the per-minute limit up front, so
+      // keep it close to what each round needs: a few tool calls, or a short reply.
+      max_completion_tokens: haveData ? 1200 : 500,
     }),
     signal,
   })
@@ -682,6 +684,16 @@ async function groqChat(messages: ChatMessage[], signal: AbortSignal): Promise<G
     )
   }
   return json.choices[0]
+}
+
+// Groq's 429 text names the limit hit ("tokens per minute (TPM)" or "tokens
+// per day (TPD)") and when it clears ("Please try again in 12m3s").
+function rateLimitMessage(groqMessage: string) {
+  const daily = /per day|TPD/i.test(groqMessage)
+  const wait = /try again in ([0-9hms.]+)/i.exec(groqMessage)?.[1]?.replace(/\.$/, '')
+  return daily
+    ? `The free AI quota for today is used up${wait ? `. It resets in about ${wait}` : ', try again later'}.`
+    : `The free AI quota is busy${wait ? `. Try again in ${wait}` : ', try again in a minute'}.`
 }
 
 function badRequest(message: string, status = 400, headers: Record<string, string> = {}) {
@@ -814,7 +826,7 @@ export default async function handler(req: Request, context?: { ip?: string }): 
           console.error('companion error', e)
           const message =
             e instanceof GroqError && e.status === 429
-              ? "The free AI quota is used up for now. Try again in a minute (or tomorrow if it's the daily limit)."
+              ? rateLimitMessage(e.message)
               : e instanceof GroqError && e.status >= 500
                 ? 'The AI service is having trouble. Try again shortly.'
                 : 'Something went wrong. Try again.'
