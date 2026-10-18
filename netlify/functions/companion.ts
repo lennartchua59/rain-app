@@ -82,7 +82,7 @@ const FUNCTIONS = [
   {
     name: 'get_weather_forecast',
     description:
-      'Model forecast for any point (Open-Meteo): now, 15-minute rain for 3 hours, hourly rain chance, amount, weather, temperature, feels-like, wet-bulb, wind, gusts, UV, and a computed summary of each activity window (start plus each duration). Local times.',
+      'Model forecast for any point (Open-Meteo): now, 15-minute rain for 3 hours, hourly rain chance, amount, weather, temperature, feels-like, wind, gusts, UV, and a computed summary of each activity window (start plus each duration). Local times.',
     parameters: {
       type: 'object',
       properties: {
@@ -316,7 +316,7 @@ async function getWeatherForecast({
     `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&timezone=auto` +
     '&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,is_day' +
     '&minutely_15=precipitation,weather_code&forecast_minutely_15=12' +
-    '&hourly=precipitation_probability,precipitation,weather_code,temperature_2m,apparent_temperature,wet_bulb_temperature_2m,wind_speed_10m,wind_gusts_10m,uv_index' +
+    '&hourly=precipitation_probability,precipitation,weather_code,temperature_2m,apparent_temperature,wind_speed_10m,wind_gusts_10m,uv_index' +
     '&forecast_hours=48&daily=sunrise,sunset&forecast_days=3'
   const j = await getJson(url)
   const c = j.current
@@ -333,12 +333,17 @@ async function getWeatherForecast({
     timezone: j.timezone,
     now: `${c.time}: ${weatherText(c.weather_code)}, ${c.temperature_2m}°C (feels ${c.apparent_temperature}°C), humidity ${c.relative_humidity_2m}%, precipitation ${c.precipitation} mm, wind ${c.wind_speed_10m} km/h gusting ${c.wind_gusts_10m}, ${c.is_day === 1 ? 'daylight' : 'dark'}`,
     ...(windows.length ? { activity_windows: windows } : {}),
-    next_3h_every_15min: ['time | mm | weather'].concat(
-      (j.minutely_15.time as string[]).map(
-        (t, i) => `${shortTime(t)} | ${j.minutely_15.precipitation[i]} | ${weatherText(j.minutely_15.weather_code[i])}`,
-      ),
-    ),
-    hourly: ['time | rain chance % | mm | weather | °C | feels °C | wet-bulb °C | wind km/h | gusts | UV'].concat(
+    // Only useful when the activity starts within the 3 hours it covers.
+    ...(startMs < nowMs + 3 * HOUR_MS
+      ? {
+          next_3h_every_15min: ['time | mm | weather'].concat(
+            (j.minutely_15.time as string[]).map(
+              (t, i) => `${shortTime(t)} | ${j.minutely_15.precipitation[i]} | ${weatherText(j.minutely_15.weather_code[i])}`,
+            ),
+          ),
+        }
+      : {}),
+    hourly: ['time | rain chance % | mm | weather | °C | feels °C | wind km/h | gusts | UV'].concat(
       (j.hourly.time as string[]).slice(0, rows).map((t, i) =>
         [
           shortTime(t),
@@ -347,7 +352,6 @@ async function getWeatherForecast({
           weatherText(j.hourly.weather_code[i]),
           j.hourly.temperature_2m[i],
           j.hourly.apparent_temperature[i],
-          j.hourly.wet_bulb_temperature_2m[i],
           j.hourly.wind_speed_10m[i],
           j.hourly.wind_gusts_10m[i],
           j.hourly.uv_index[i],
@@ -622,7 +626,10 @@ function cleanHistory(history: unknown): ChatMessage[] | null {
       return null
     }
   }
-  return out
+  // Earlier turns keep only the questions and the final answers. Their lookups
+  // are stale by now (the prompt fetches fresh data every turn) and replaying
+  // them is most of what a follow-up costs against the free tier.
+  return out.filter((m) => m.role === 'user' || (m.role === 'assistant' && !m.tool_calls && m.content))
 }
 
 class GroqError extends Error {
@@ -645,11 +652,16 @@ const MAX_RATE_LIMIT_WAIT_MS = 20_000
 type GroqChoice = { finish_reason: string; message: { content: string | null; tool_calls?: ToolCall[] } }
 
 async function groqChat(messages: ChatMessage[], signal: AbortSignal): Promise<GroqChoice> {
+  const model = process.env.GROQ_MODEL || DEFAULT_MODEL
+  // Reasoning tokens count against the free tier too. Picking which lookups to
+  // run needs little thought; writing the verdict from the results needs more.
+  const haveData = messages.some((m) => m.role === 'tool')
   const res = await fetch(GROQ_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
     body: JSON.stringify({
-      model: process.env.GROQ_MODEL || DEFAULT_MODEL,
+      model,
+      ...(model.startsWith('openai/gpt-oss') ? { reasoning_effort: haveData ? 'medium' : 'low' } : {}),
       messages,
       tools: TOOLS,
       tool_choice: 'auto',
