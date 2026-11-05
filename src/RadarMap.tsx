@@ -134,7 +134,7 @@ const RAINVIEWER_FLOW_CONFIG: FlowSourceConfig = {
   flowCell: 12,
   blockHalf: 10,
   localRadius: 3,
-  baselineMin: 30,
+  baselineMin: 10,
   searchRadius: 12,
   pairRadius: 4,
   // ~1,100 km² of this ~470km window.
@@ -1283,7 +1283,9 @@ function forecastConfidence(leadMin: number, motion: MotionSource, smallDomain: 
 }
 
 const PAST_MINUTES = 60
-const FUTURE_MINUTES = 120
+// Backtested on SG scans: past ~90 min the forecast scores below simply
+// assuming the rain stays put (+120: 3.2 vs 4.2), so it isn't shown.
+const FUTURE_MINUTES = 90
 const STEP_MINUTES = 5
 // Fallback guess used only for the brief moment before the first real probe
 // (below) resolves — after that, "now" is whatever MSS frame actually loaded.
@@ -1810,7 +1812,7 @@ export default function RadarMap() {
                 </span>
               )}
             </button>
-            <span className="range-edge">+{Math.round(FUTURE_MINUTES / 60)}h</span>
+            <span className="range-edge">+{FUTURE_MINUTES}m</span>
           </div>
 
           <div className="radar-note">

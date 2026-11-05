@@ -156,7 +156,9 @@ export type DrawParams = {
 // Forecast inflow: rain on the upwind edge of the radar image keeps arriving,
 // fading out once the trace is this far beyond the edge (shared with the
 // scorekeeping copy in verify.ts).
-export const INFLOW_FADE_KM = 25
+// Backtested on 60h of SG scans: refilling from the edge beats leaving it dry
+// (+60 min score 8.2 -> 10.2 at 25km, 10.4 at 50km), and wider is better.
+export const INFLOW_FADE_KM = 50
 
 export class FlowRenderer {
   private gl: WebGL2RenderingContext

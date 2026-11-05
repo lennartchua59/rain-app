@@ -57,8 +57,8 @@ type Nowcast = {
 
 // Lead-time smoothing: forecast skill for small features decays fastest, so
 // the extrapolated field is progressively smoothed. km of radius per minute
-// of lead time (~6 km at +2h).
-const BLUR_KM_PER_MIN = 0.05
+// of lead time (~2 km at +90 min). Kept gentle so storm shapes stay natural.
+const BLUR_KM_PER_MIN = 0.022
 // Trend saturation, in baseline intervals: the measured growth/decay is
 // applied at most ~this many intervals' worth, since trends don't persist.
 const TREND_TAU = 1
@@ -533,7 +533,7 @@ export function FlowRadarLayer({
       domainKm: [km.w, km.h],
       // Fades gently with lead time so the forecast reads as less certain
       // than observed scans without washing out.
-      opacity: opacity * (1 - 0.25 * Math.min(1, leadMin / 120)),
+      opacity: opacity * (1 - 0.25 * Math.min(1, leadMin / 90)),
       view: overlay.view,
     })
   }
