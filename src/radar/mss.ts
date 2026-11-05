@@ -16,14 +16,21 @@ export const MSS_STEP_MINUTES = 5
 // ~470km (~0.6km/px) every 10 min. Analysis cells end up ~0.6km (MSS) and
 // ~2.4km (RainViewer), and search radii cover storm motion up to roughly
 // 40km/h either side of the steering-wind first guess.
+//
+// Backtested on 60 hours of real MSS scans (440 forecasts, pixel-level CSI at
+// +15/+30/+60 min): matching at full resolution over a 10 min baseline scored
+// 26.5/16.8/9.3 against 23.7/15.2/8.9 for the earlier factor-2, 15 min setup.
+// The sharper vectors matter more than any other knob: block size, local
+// radius, coverage floor and trend gain all moved the score by under a point.
+// Cost is ~10x per forecast (~350ms on a desktop), once per new scan.
 export const MSS_FLOW_CONFIG: FlowSourceConfig = {
-  factor: 2,
-  flowCell: 8,
-  blockHalf: 8,
-  localRadius: 3,
-  baselineMin: 15,
-  searchRadius: 16,
-  pairRadius: 6,
+  factor: 1,
+  flowCell: 16,
+  blockHalf: 16,
+  localRadius: 4,
+  baselineMin: 10,
+  searchRadius: 32,
+  pairRadius: 12,
   // ~90 km² of this 63x35km image. Below that it's scattered specks, whose
   // tracked "motion" was measured jumping around at random.
   minCoverage: 0.04,
