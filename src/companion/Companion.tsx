@@ -42,6 +42,14 @@ const VERDICTS: Record<string, Verdict> = {
   'don’t go': 'no',
 }
 
+const INDOOR_FOLLOWUP = 'Any indoor place I can go for the same vibes?'
+
+// The verdict on a reply's first line, if it has one.
+function verdictOf(text: string): Verdict | null {
+  const m = /^\**verdict:\s*(.+?)\**\s*$/im.exec(text.split('\n', 1)[0].trim())
+  return m ? (VERDICTS[m[1].replace(/\*+/g, '').trim().toLowerCase()] ?? null) : null
+}
+
 function IconSparkle({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
@@ -296,6 +304,8 @@ export default function Companion() {
     inputRef.current?.focus()
   }, [])
 
+  const lastReplyId = items.findLast((it) => it.role === 'assistant')?.id
+
   return (
     <>
       <button className="cmp-launcher" onClick={() => setOpen(true)} aria-label="Ask the weather companion">
@@ -357,6 +367,13 @@ export default function Companion() {
                     </div>
                   )}
                   {it.error && <div className="cmp-error">{it.error}</div>}
+                  {!busy && !it.error && it.id === lastReplyId && (verdictOf(it.text) === 'hold' || verdictOf(it.text) === 'no') && (
+                    <div className="cmp-followups">
+                      <button className="cmp-chip" onClick={() => ask(INDOOR_FOLLOWUP)}>
+                        Indoor option, same vibes
+                      </button>
+                    </div>
+                  )}
                 </div>
               ),
             )
